@@ -7,7 +7,11 @@ from fastapi import Header, HTTPException, Request, status
 load_dotenv()
 
 def get_webhook_secret() -> bytes:
-    return os.getenv("ADMIN_WEBHOOK_SECRET", "e077b39f838ff7d99e8725bb4c1999abf4d4bfd8902e922991401b66bc91045a").encode()
+    secret = os.getenv("ADMIN_WEBHOOK_SECRET")
+    if not secret:
+        # Default development secret; override with ADMIN_WEBHOOK_SECRET in production
+        secret = "resolveops_default_development_secret_change_in_production"
+    return secret.encode()
 
 
 async def verify_admin_signature(
