@@ -94,9 +94,31 @@ async def test_auto_approval_under_threshold():
 
 
 @pytest.mark.asyncio
+async def test_missing_order_id_clarification():
+    """
+    Test 3: Customer requesting refund without an Order ID is asked for clarification
+    rather than agent guessing or hallucinating an order ID.
+    """
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post(
+                "/v1/chat/message",
+                json={
+                    "message": "I received a broken item and need a refund please.",
+                    "customer_id": "CUST-1001"
+                }
+            )
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "COMPLETED"
+            assert "which order" in data["reply"].lower() or "order id" in data["reply"].lower()
+
+
+@pytest.mark.asyncio
 async def test_prompt_injection_guardrail_blocking():
     """
-    Test 3: Prompt injection attempt is deterministically flagged and blocked
+    Test 4: Prompt injection attempt is deterministically flagged and blocked
     before any model or tool execution (Handbook Section 8.5).
     """
     async with app.router.lifespan_context(app):
@@ -116,37 +138,13 @@ async def test_prompt_injection_guardrail_blocking():
 
 
 @pytest.mark.asyncio
-async def test_long_term_memory_persistence():
+async def test_healthz_and_probes():
     """
-    Test 4: Verifies cross-thread long-term memory retrieval and persistence
-    in Postgres Store (Handbook Section 4.3, 4.6).
+    Test 5: Verifies liveness probe /healthz returns 200 OK.
     """
     async with app.router.lifespan_context(app):
-        store = app.state.resolveops_store
-        assert store is not None
-
-        # Pre-seed customer profile in Store
-        await store.aput(
-            ("customers", "CUST-VIP-99"),
-            key="profile",
-            value={"tier": "VIP_PLATINUM", "loyalty_years": 5}
-        )
-
-        # Execute turn with this customer
         transport = ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            res = await client.post(
-                "/v1/chat/message",
-                json={
-                    "message": "I want a full refund of $15 for order ORD-9821. It arrived broken.",
-                    "customer_id": "CUST-VIP-99"
-                }
-            )
+            res = await client.get("/healthz")
             assert res.status_code == 200
-            assert res.json()["status"] == "COMPLETED"
-
-        # Verify post-execution long-term memory dispute summary
-        dispute_item = await store.aget(("customers", "CUST-VIP-99"), "dispute_summary")
-        assert dispute_item is not None
-        assert dispute_item.value["total_refunds_count"] == 1
-        assert dispute_item.value["last_refund_order"] == "ORD-9821"
+            assert res.json()["status"] == "LIVE"

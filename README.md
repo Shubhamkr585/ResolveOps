@@ -1,12 +1,21 @@
-# ResolveOps: Autonomous Customer Support Resolution Engine
+# ResolveOps: Autonomous Customer Resolution Agent Engine
 
-ResolveOps is a production-grade autonomous agent engine designed in alignment with the **LangGraph + Agent Engineering Handbook**. It provides deterministic guardrails, multi-tier memory management (short-term thread checkpointing and long-term cross-session storage), context-budget engineering, distributed tool safety, and structured observability.
+ResolveOps is a production-grade autonomous agent engine built with **LangGraph**, **FastAPI**, **PostgreSQL**, and **Redis**. Designed in strict accordance with the **LangGraph Agent Engineering Handbook**, it implements deterministic state transitions, multi-tier memory management (short-term PostgreSQL checkpointing and long-term customer Store), context-budget engineering, distributed tool safety (mutex locking + idempotency), and cryptographic Human-in-the-Loop (HITL) approval workflows.
 
 ---
 
-## 1. Architecture Overview
+## Key Highlights
 
-ResolveOps implements the Capstone Architecture (*ResolveAI*) specified in Section 11.2 and Page 16 of the Agent Engineering Handbook.
+- **Zero Hardcoding**: All business limits, return eligibility windows, and product policies are retrieved dynamically from PostgreSQL using Full-Text Search (`ts_rank` + `plainto_tsquery`).
+- **Real Database Transactions**: Real atomic mutations update orders to `REFUNDED` and write immutable ledger records to `refund_transactions` with `SELECT ... FOR UPDATE` isolation.
+- **Self-Bootstrapping Database**: An automated startup bootstrapper (`core/db_bootstrap.py`) idempotently initializes all tables, full-text indexes, official policies, and a 150-order dataset upon boot on any cloud PostgreSQL instance (Neon, Supabase, Render, AWS RDS).
+- **Interactive Interview Dashboard**: A modern web interface served at `/dashboard` with a live Customer Chat simulator, Supervisor HITL Desk, live PostgreSQL data inspector, and Redis mutex monitoring.
+- **Two-Tier Distributed Safety**: Redis distributed locking (`lock:entity:{order_id}`) and deterministic UUIDv5 idempotency keys (`idempotency:{action_id}`) prevent double-refunds during network retries.
+- **Enterprise Observability**: Structured JSON audit logging with correlation IDs (`thread_id`, `run_id`, `task_id`), execution timers, and Prometheus/Kubernetes liveness (`/healthz`) and readiness (`/readyz`) probes.
+
+---
+
+## System Architecture
 
 ```
 START
@@ -15,183 +24,179 @@ START
 [guardrail_input] --------> (Detects prompt injection and redacts PII)
   |
   v
-[triage] -----------------> (Classifies intent and sentiment; resilient fallback)
+[triage] -----------------> (Classifies intent and sentiment; dual-model fallback)
   |
   v
-[context_loader] ---------> (Loads long-term customer memory from Store; prunes context window)
+[context_loader] ---------> (Loads durable customer memory from Store; prunes context window)
   |
   v
-[investigation] ----------> (Executes read-only tools: get_order_details, search_refund_policy)
+[investigation] ----------> (Executes read-only tools: DB orders, DB customer history, DB policies FTS)
   |
   v
-[resolution_planner] -----> (Synthesizes evidence and constructs deterministic PendingAction)
-  |
-  v
-<check_escalation_guard> -> (Applies deterministic threshold checks: amount > $100.00?)
-  |                      |
-  | (> $100.00)          | (<= $100.00)
-  v                      v
-[hitl_suspension]      [tool_execution] (Protected by Redis Distributed Mutex & Idempotency)
-  |                      |
-  +----------------------+
-  |
-  v
-[verifier_and_memory] ----> (Verifies settlement, updates rolling summary, persists durable facts)
-  |
-  v
- END
+<check_investigation_sufficiency>
+  |-- (Missing Order ID) ------> [ask_clarifying]
+  |-- (Order Not Found) -------> [order_not_found]
+  |-- (Outside Return Window) -> [order_ineligible]
+  |-- (Policy FAQ Question) ---> [policy_rag]
+  |-- (Complete Evidence) -----> [resolution_planner]
+                                       |
+                                       v
+                             <check_escalation_guard>
+                               /                   \
+               (Amount > Policy Limit)        (Amount <= Policy Limit)
+                             /                       \
+             [hitl_suspension]              [tool_execution]
+             (Native interrupt)             (Atomic DB Mutation + Redis Lock)
+                     |                               |
+       (HMAC Signed Admin Webhook)                   |
+                     |                               |
+                     +-------------------------------+
+                     |
+                     v
+             [verifier_and_memory] -> (Persists dispute summary in Postgres Store)
+                     |
+                     v
+                    END
 ```
 
 ---
 
-## 2. Memory Architecture
+## Memory & Context Architecture
 
-ResolveOps separates memory into three distinct scopes as mandated by Section 4 of the Handbook:
+ResolveOps separates memory into three distinct scopes:
 
-### 2.1 Working Memory (Graph State)
-- **Scope**: Current execution run.
-- **Implementation**: `ResolveOpsState` (`core/state.py`).
-- **Data Held**: Transient task variables, intermediate tool findings (`investigation_evidence`), routing decisions, and execution timers.
-
-### 2.2 Short-Term Memory (Thread Checkpointer)
-- **Scope**: Conversation turns within a specific thread (`thread_id`).
-- **Implementation**: `AsyncPostgresSaver` backed by PostgreSQL connection pool (`main.py`).
-- **Capabilities**: Enables human-in-the-loop suspension (`interrupt()`), durable state snapshots, and fault tolerance across server restarts.
-
-### 2.3 Long-Term Memory (Cross-Thread Store)
-- **Scope**: Durable customer profile, preferences, and dispute statistics across independent threads.
-- **Implementation**: `AsyncPostgresStore` (`core/memory.py`).
-- **Namespace Strategy**: Scoped under `("customers", customer_id)`.
-- **Write Policy**: Only durable, verified outcomes (such as settled refunds, loyalty tiers, and communication preferences) are persisted. Unverified conversational noise is excluded.
+1. **Working Memory**: In-flight state attributes (`messages`, `investigation_evidence`, `pending_action`, `action_results`) residing in graph state during execution.
+2. **Short-Term Memory**: Multi-turn dialogue history checkpointed across user sessions into PostgreSQL via `AsyncPostgresSaver`.
+3. **Long-Term Memory**: Cross-thread durable customer facts (account tier, dispute history, settlement counts) persisted across threads in PostgreSQL via `AsyncPostgresStore` under the `("customers", customer_id)` namespace.
+4. **Context Budget Management**: A sliding token-budget window retains the most recent 6 verbatim messages, compressing older turns into an evolving rolling summary.
 
 ---
 
-## 3. Context Engineering & Token-Budget Management
+## Quickstart & Local Setup
 
-To prevent context-window overflow and degradation (Handbook Section 5):
-- **Sliding Window**: The most recent 6 messages (`MAX_VERBATIM_MESSAGES`) are retained verbatim.
-- **Rolling Compact Summary**: Turns exceeding the verbatim limit are compressed into a structured summary (`goal`, `decisions`, `evidence_refs`) and passed to downstream nodes.
-- **Tool Output Hygiene**: Read-only tools return bounded summaries rather than raw database dumps.
+### 1. Prerequisites
+- Python 3.11+
+- Docker & Docker Compose (or local PostgreSQL and Redis)
 
----
+### 2. Environment Setup
+Copy the environment template:
+```bash
+cp .env.example .env
+```
 
-## 4. Deterministic Guardrails & Security
+Provide your `GEMINI_API_KEY` in `.env` (optional; deterministic heuristics run if omitted).
 
-Prompts are guidance; deterministic code provides security boundaries (Handbook Section 8.4):
+### 3. Start Database & Redis via Docker
+```bash
+docker-compose up -d
+```
+*Note: Starts PostgreSQL on port `5433` and Redis on port `6379`.*
 
-1. **Prompt Injection Defense (`core/guardrails.py`)**:
-   - Detects adversarial patterns such as instruction overrides, database dump requests, and role impersonation before reaching model nodes.
-   - Malicious inputs are immediately diverted to a security abort path.
+### 4. Install Dependencies
+```bash
+python -m venv .venv
+# Windows
+.\.venv\Scripts\activate
+# Linux/macOS
+source .venv/bin/activate
 
-2. **PII Masking**:
-   - Redacts credit card numbers and Social Security numbers prior to state persistence.
+pip install -r requirements.txt
+```
 
-3. **Authorization & Tenant Isolation**:
-   - Read-only tools verify customer authorization at the service layer (`customer_id` check in `tools/order.py`).
-
-4. **Human-in-the-Loop (HITL) Threshold**:
-   - Refund requests exceeding **$100.00** or sessions flagged with negative customer sentiment (< -0.6) automatically pause via `langgraph.types.interrupt()`.
-   - Requests below or equal to $100.00 execute automatically.
-
-5. **Distributed Mutex & Idempotency (`core/decorators.py`)**:
-   - Write actions (`tools/refund.py`) are decorated with `@transactional_tool`.
-   - Uses Redis distributed locking with time-to-live (TTL) and atomic Lua release scripts.
-   - Enforces deterministic UUIDv5 idempotency keys to prevent duplicate execution during network retries.
-
----
-
-## 5. Observability & Audit Logging
-
-Implements Section 9 of the Handbook:
-- **Correlation Identifiers**: Every event binds `thread_id`, `customer_id`, `task_id`, and `run_id`.
-- **Execution Timers**: Measures millisecond latency for each node transition and tool invocation.
-- **Structured JSON Logs**: Emits machine-parsable audit trails for compliance and debugging.
+### 5. Run the Server
+```bash
+python main.py
+```
+The application will automatically bootstrap tables, full-text indexes, and seed catalog data on startup.
 
 ---
 
-## 6. API Reference
+## Interactive Interview Dashboard
 
-### 6.1 Customer Chat
-- **Endpoint**: `POST /v1/chat/message`
-- **Payload**:
+Open your browser to:
+```
+http://127.0.0.1:8000/dashboard
+```
+
+The presentation dashboard includes:
+1. **Live Customer Chat**: Test scenarios including high-value refunds, under-threshold refunds, missing order ID inquiries, and prompt injection attacks.
+2. **Supervisor HITL Approval Desk**: Displays active suspended actions awaiting human authorization with 1-click HMAC-signed "Approve" and "Reject" triggers.
+3. **Live System of Record**: View PostgreSQL `orders`, `refund_transactions`, and `customers` in real time with auto-refresh.
+4. **Health & OpenAPI Links**: Direct access to `/docs` and `/readyz`.
+
+---
+
+## Production Cloud Deployment
+
+### Universal Docker Container
+Build and run the production container:
+```bash
+docker build -t resolveops:latest .
+docker run -p 8000:8000 --env-file .env resolveops:latest
+```
+
+### Full Production Stack with Docker Compose
+```bash
+docker compose -f docker-compose.prod.yml up -d
+```
+
+### 1-Click Deploy on Render / Railway
+This repository contains `render.yaml` for 1-click deployment on Render. The application auto-detects SSL connection strings (`sslmode=require`) from managed PostgreSQL providers like **Neon**, **Supabase**, and **Render**.
+
+---
+
+## API Reference
+
+### 1. Customer Chat
+- **POST** `/v1/chat/message`
+- **Request Body**:
   ```json
   {
-    "message": "I want a full refund of $12 for order ORD-9821. It arrived completely broken.",
+    "message": "I demand an immediate refund for order ORD-9821 of $120. It arrived broken.",
     "customer_id": "CUST-1001",
     "thread_id": "optional-uuid"
   }
   ```
-- **Response (Auto-Approved, <= $100)**:
+- **Response** (When exceeding policy limit):
   ```json
   {
-    "thread_id": "0fc6cac9-d07a-4231-b2c7-9cbaf85f06d5",
-    "status": "COMPLETED",
-    "reply": "Successfully refunded $12.00 for order ORD-9821.",
-    "interruption_details": null
-  }
-  ```
-- **Response (Suspended for Review, > $100)**:
-  ```json
-  {
-    "thread_id": "71ad978c-d5ff-4488-a947-f78d763ff486",
+    "thread_id": "b9214804-c0ee-4192-8528-424c279f7df9",
     "status": "SUSPENDED_FOR_APPROVAL",
-    "reply": "Your refund request exceeds automated limits ($100). It has been sent to a human supervisor for review.",
+    "reply": "Your refund request for order ORD-9821 ($120.00) exceeds our automated approval limit ($100.00)...",
     "interruption_details": {
       "type": "MUTATION_APPROVAL_REQUIRED",
-      "action_id": "b3c6b5d9-3aa6-5094-9d7b-a5a817c9f50c",
+      "action_id": "e893d146-4972-5073-9964-c7a1d6de24e8",
       "action_type": "refund_order",
       "amount": 120.0,
-      "entity_id": "ORD-9821",
-      "reason": "Item arrived damaged/broken"
+      "entity_id": "ORD-9821"
     }
   }
   ```
 
-### 6.2 Supervisor Approval Webhook
-- **Endpoint**: `POST /v1/admin/webhooks/resume-action`
-- **Security**: Requires `X-ResolveOps-Signature` header computed as HMAC-SHA256 over raw JSON payload using `ADMIN_WEBHOOK_SECRET`.
-- **Payload**:
+### 2. Supervisor Webhook Resume
+- **POST** `/v1/admin/webhooks/resume-action`
+- **Headers**:
+  - `X-ResolveOps-Signature`: `sha256=<HMAC-SHA256 signature of body using ADMIN_WEBHOOK_SECRET>`
+- **Request Body**:
   ```json
   {
-    "thread_id": "71ad978c-d5ff-4488-a947-f78d763ff486",
-    "action_id": "b3c6b5d9-3aa6-5094-9d7b-a5a817c9f50c",
+    "thread_id": "b9214804-c0ee-4192-8528-424c279f7df9",
+    "action_id": "e893d146-4972-5073-9964-c7a1d6de24e8",
     "decision": "APPROVED",
-    "admin_id": "SUPERVISOR-42",
-    "override_reason": "Verified attached damage photos."
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "status": "SUCCESS",
-    "thread_id": "71ad978c-d5ff-4488-a947-f78d763ff486",
-    "action_id": "b3c6b5d9-3aa6-5094-9d7b-a5a817c9f50c",
-    "execution_result": {
-      "transaction_id": "tx_rf_ORD-9821",
-      "order_id": "ORD-9821",
-      "refunded_amount": 120.0,
-      "status": "SETTLED"
-    },
-    "detail": "Resumed and executed with status APPROVED."
+    "admin_id": "ADMIN-SUPERVISOR-1",
+    "override_reason": "Verified damaged photos"
   }
   ```
 
-### 6.3 Health Check
-- **Endpoint**: `GET /health`
-- **Response**: `{"status": "healthy", "service": "ResolveOps Engine"}`
+### 3. Observability & Health Probes
+- **GET** `/healthz` - Liveness probe (returns `200 OK`)
+- **GET** `/readyz` - Readiness probe (checks active PostgreSQL and Redis socket connectivity)
 
 ---
 
-## 7. Verification & Automated Test Suite
+## Running the Test Suite
 
-The test suite covers end-to-end paths, guardrails, and memory persistence:
-
-```powershell
-.\.venv\Scripts\pytest.exe -v
+```bash
+pytest -v
 ```
-
-### Verified Test Cases:
-1. `test_end_to_end_hitl_refund_flow`: Verifies HITL pause for amounts exceeding $100.00 and resumption via signed supervisor HMAC webhook.
-2. `test_auto_approval_under_threshold`: Verifies instant execution for amounts <= $100.00.
-3. `test_prompt_injection_guardrail_blocking`: Verifies deterministic blocking of prompt injection attacks.
-4. `test_long_term_memory_persistence`: Verifies cross-thread retrieval and post-settlement persistence in `AsyncPostgresStore`.
+All integration tests verify the end-to-end LangGraph cycle, prompt injection guardrails, dynamic clarification, and HMAC webhook resumption.

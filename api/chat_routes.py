@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage
 from langgraph.graph.state import CompiledStateGraph
 
+from api.dashboard_routes import register_suspended_interrupt, remove_suspended_interrupt
+
 logger = logging.getLogger("resolveops.chat")
 router = APIRouter(prefix="/v1/chat", tags=["Customer Chat"])
 
@@ -61,9 +63,11 @@ async def send_chat_message(
             if state_snapshot.tasks and hasattr(state_snapshot.tasks[0], "interrupts") and state_snapshot.tasks[0].interrupts:
                 interrupt_payload = state_snapshot.tasks[0].interrupts[0].value
 
+            register_suspended_interrupt(thread_id, interrupt_payload)
+
             reply_text = (
                 interrupt_payload.get("message")
-                or f"Your refund request for order {interrupt_payload.get('entity_id', '')} of ${interrupt_payload.get('amount', 0.0):.2f} exceeds automated limits ($100.00). It has been sent to a human supervisor for review."
+                or f"Your refund request for order {interrupt_payload.get('entity_id', '')} of ${interrupt_payload.get('amount', 0.0):.2f} exceeds automated limits. It has been sent to a human supervisor for review."
             )
             return ChatResponse(
                 thread_id=thread_id,
@@ -73,6 +77,7 @@ async def send_chat_message(
             )
 
         # If completed normally
+        remove_suspended_interrupt(thread_id)
         last_message = res["messages"][-1].content if (res and res.get("messages")) else "Request processed."
         return ChatResponse(
             thread_id=thread_id,

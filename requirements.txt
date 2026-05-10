@@ -1,20 +1,22 @@
 # LangGraph, LangChain core & model providers
-langgraph
-langchain-core
-langgraph-checkpoint-postgres
-langchain-openai
-pydantic
+langgraph>=1.2.20
+langchain-core>=1.7.6
+langgraph-checkpoint-postgres>=3.2.0
+langchain-google-genai>=4.4.3
+langchain-openai>=1.7.4
+pydantic>=2.10.0
+pydantic-settings>=2.8.0
 
 # FastAPI, ASGI server, and HTTP tools
-fastapi
-uvicorn
-httpx
+fastapi>=0.115.0
+uvicorn>=0.34.0
+httpx>=0.28.0
 
 # Database, Checkpointing & Async drivers
-psycopg[binary,pool]
-redis
+psycopg[binary,pool]>=3.2.0
+redis>=5.2.0
 
 # Testing & Dev tooling
-pytest
-pytest-asyncio
-python-dotenv
+pytest>=8.3.0
+pytest-asyncio>=0.25.0
+python-dotenv>=1.0.1

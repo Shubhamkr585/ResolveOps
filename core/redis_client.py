@@ -1,9 +1,9 @@
-import os
 import asyncio
 import redis.asyncio as aioredis
-from typing import Optional
+from typing import Optional, Dict
+from core.config import get_settings
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+settings = get_settings()
 
 # Safe lock release script: deletes key ONLY if value matches the owner token
 RELEASE_LOCK_LUA = """
@@ -14,13 +14,14 @@ else
 end
 """
 
-_clients: dict = {}
+_clients: Dict[int, aioredis.Redis] = {}
 
 
 def get_redis_client() -> aioredis.Redis:
     """
     Returns an async Redis client bound to the current running event loop.
     Prevents 'Event loop is closed' errors during multi-test execution or process restarts.
+    Supports redis:// and rediss:// (TLS) URLs.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -29,7 +30,7 @@ def get_redis_client() -> aioredis.Redis:
 
     loop_key = id(loop) if loop is not None else 0
     if loop_key not in _clients:
-        _clients[loop_key] = aioredis.from_url(REDIS_URL, decode_responses=True)
+        _clients[loop_key] = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
     return _clients[loop_key]
 
 

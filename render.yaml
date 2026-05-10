@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: resolveops-engine
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: resolveops-db
+          property: connectionString
+      - key: REDIS_URL
+        value: redis://red-placeholder:6379/0
+      - key: ADMIN_WEBHOOK_SECRET
+        generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
+      - key: GEMINI_FALLBACK_MODEL
+        value: gemini-3.5-flash
+
+databases:
+  - name: resolveops-db
+    databaseName: resolveops
+    user: postgres
+    plan: free

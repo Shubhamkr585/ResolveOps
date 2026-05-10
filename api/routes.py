@@ -5,6 +5,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from api.schemas import AdminApprovalWebhookPayload, WebhookResponse
 from api.security import verify_admin_signature
+from api.dashboard_routes import remove_suspended_interrupt
 
 logger = logging.getLogger("resolveops.api")
 router = APIRouter(prefix="/v1/admin/webhooks", tags=["HITL Admin"])
@@ -63,6 +64,7 @@ async def resume_suspended_action(
 
     try:
         resumed_state = await graph.ainvoke(Command(resume=resume_payload), config=thread_config)
+        remove_suspended_interrupt(payload.thread_id)
         action_results = resumed_state.get("action_results", [])
         latest_res = action_results[-1] if action_results else None
         final_status = "SUCCESS" if payload.decision == "APPROVED" else "REJECTED_BY_ADMIN"
