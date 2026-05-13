@@ -46,9 +46,10 @@ async def lifespan(app: FastAPI):
     4. Compiles and mounts the autonomous resolution StateGraph.
     """
     logger.info("Initializing ResolveOps Engine...")
+    pool_size = 3 if os.getenv("VERCEL") else 20
     async with AsyncConnectionPool(
         conninfo=settings.DATABASE_URL,
-        max_size=20,
+        max_size=pool_size,
         kwargs={"autocommit": True}
     ) as pool:
         # Idempotent database bootstrap (tables, full-text indexes, catalog seed)
