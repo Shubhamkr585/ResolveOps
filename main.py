@@ -5,6 +5,7 @@ import selectors
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg_pool import AsyncConnectionPool
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -76,6 +77,15 @@ app = FastAPI(
     description="Autonomous customer resolution engine with LangGraph, PostgreSQL full-text search, and Redis mutex locking.",
     version="2.0.0",
     lifespan=lifespan
+)
+
+# Enable CORS for decoupled frontends (e.g. Vercel, localhost)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Mount application routers

@@ -14,7 +14,7 @@ services:
           name: resolveops-db
           property: connectionString
       - key: REDIS_URL
-        value: redis://red-placeholder:6379/0
+        sync: false
       - key: ADMIN_WEBHOOK_SECRET
         generateValue: true
       - key: GEMINI_API_KEY

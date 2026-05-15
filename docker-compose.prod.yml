@@ -13,7 +13,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - ADMIN_WEBHOOK_SECRET=${ADMIN_WEBHOOK_SECRET:-resolveops_prod_webhook_secret_key_99}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.8-flash}
       - GEMINI_FALLBACK_MODEL=${GEMINI_FALLBACK_MODEL:-gemini-3.5-flash}
     depends_on:
       postgres:
