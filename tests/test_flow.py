@@ -94,9 +94,32 @@ async def test_auto_approval_under_threshold():
 
 
 @pytest.mark.asyncio
+async def test_list_all_orders_inquiry():
+    """
+    Test 3: Customer asking to list all their orders receives their real orders
+    and is not falsely blocked by order tenant authorization errors.
+    """
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post(
+                "/v1/chat/message",
+                json={
+                    "message": "list down all my orders",
+                    "customer_id": "CUST-1001"
+                }
+            )
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "COMPLETED"
+            assert "ORD-" in data["reply"]
+            assert "Authorization Denied" not in data["reply"]
+
+
+@pytest.mark.asyncio
 async def test_missing_order_id_clarification():
     """
-    Test 3: Customer requesting refund without an Order ID is asked for clarification
+    Test 4: Customer requesting refund without an Order ID is asked for clarification
     rather than agent guessing or hallucinating an order ID.
     """
     async with app.router.lifespan_context(app):
@@ -118,7 +141,7 @@ async def test_missing_order_id_clarification():
 @pytest.mark.asyncio
 async def test_prompt_injection_guardrail_blocking():
     """
-    Test 4: Prompt injection attempt is deterministically flagged and blocked
+    Test 5: Prompt injection attempt is deterministically flagged and blocked
     before any model or tool execution (Handbook Section 8.5).
     """
     async with app.router.lifespan_context(app):
@@ -140,7 +163,7 @@ async def test_prompt_injection_guardrail_blocking():
 @pytest.mark.asyncio
 async def test_healthz_and_probes():
     """
-    Test 5: Verifies liveness probe /healthz returns 200 OK.
+    Test 6: Verifies liveness probe /healthz returns 200 OK.
     """
     async with app.router.lifespan_context(app):
         transport = ASGITransport(app=app)
