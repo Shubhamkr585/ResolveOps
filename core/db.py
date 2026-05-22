@@ -283,6 +283,52 @@ async def execute_order_refund(
                 }
 
 
+async def execute_order_cancellation(order_id: str, customer_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Cancels an order if it is in PROCESSING status according to store policy POL-ACC-05.
+    If the order is already SHIPPED or DELIVERED, returns the policy constraint reason.
+    """
+    pool = get_db_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    SELECT customer_id, status, order_total
+                    FROM orders
+                    WHERE UPPER(order_id) = UPPER(%s)
+                    FOR UPDATE;
+                """, (order_id.strip(),))
+                row = await cur.fetchone()
+
+                if not row:
+                    return {"success": False, "reason": f"Order '{order_id}' was not found under your account."}
+
+                cust_id, current_status, total = row
+                if customer_id and cust_id != customer_id:
+                    return {"success": False, "reason": "This order number does not match your registered account."}
+
+                if current_status == "PROCESSING":
+                    await cur.execute("""
+                        UPDATE orders
+                        SET status = 'CANCELED'
+                        WHERE UPPER(order_id) = UPPER(%s);
+                    """, (order_id.strip(),))
+                    logger.info(f"Order {order_id} successfully canceled in database.")
+                    return {
+                        "success": True,
+                        "order_id": order_id,
+                        "refunded_amount": float(total),
+                        "status": "CANCELED"
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "order_id": order_id,
+                        "status": current_status,
+                        "reason": f"Order {order_id} is already {current_status} and cannot be canceled in transit. Once it arrives, you can request a return within 30 days."
+                    }
+
+
 async def get_dashboard_data() -> Dict[str, Any]:
     """Retrieves live aggregate data for the interview presentation dashboard."""
     pool = get_db_pool()

@@ -19,6 +19,7 @@ from core.observability import AuditLogger, ExecutionTimer
 from tools.order import get_order_details, get_customer_history
 from tools.policy import search_refund_policy
 from tools.refund import process_refund_tool
+from core.db import execute_order_cancellation
 
 logger = logging.getLogger("resolveops.graph")
 settings = get_settings()
@@ -56,10 +57,34 @@ Core Directives:
 1. Ground every answer in the provided Evidence below (Customer History, Orders, Policies).
 2. If the customer asks to list their orders or asks what they purchased, provide a clean, organized list of their orders with Order ID, Total, Status, Date, Tracking Number, and Items.
 3. If the customer asks to track an order or check delivery status, report the exact status, delivery date, and tracking number.
-4. If the customer wants a refund but did not specify an Order ID, list their recent eligible orders and ask which specific order they want to resolve.
-5. If the customer's order is outside the return window, explain the policy gently and mention the return window limit.
-6. If an order ID belongs to a different customer account, explain that the order was not found under their registered account without exposing other customer data.
-7. Be concise, polite, professional, and helpful. Do NOT use emojis."""
+4. If the customer asks to cancel an order:
+   - If the order is in PROCESSING status: state clearly that the order has been successfully canceled and the charge voided/refunded.
+   - If the order has shipped or is delivered: explain politely that orders already in transit or delivered cannot be canceled, and that they may initiate a return within 30 days after arrival.
+   - If the order is not found under their account: inform them that the order number was not located in their account and list their active orders.
+5. If the customer wants a refund but did not specify an Order ID, list their recent eligible orders and ask which specific order they want to resolve.
+6. If the customer's order is outside the return window, explain the policy gently and mention the return window limit.
+7. If the customer asks about store policies (returns, warranty, shipping), answer concisely and directly without dumping large blocks of raw policy text.
+8. Be conversational, polite, professional, and helpful. Strictly DO NOT use emojis."""
+
+
+def extract_text_from_message(msg: Any) -> str:
+    """Safely extracts clean string text from BaseMessage or content block."""
+    if not msg:
+        return ""
+    content = msg.content if hasattr(msg, "content") else msg
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict) and "text" in p:
+                parts.append(p["text"])
+            else:
+                parts.append(str(p))
+        return "".join(parts).strip()
+    return str(content).strip()
 
 
 def extract_order_id_from_text(text: str) -> Optional[str]:
@@ -70,26 +95,44 @@ def extract_order_id_from_text(text: str) -> Optional[str]:
     return None
 
 
-def extract_order_id_from_context(messages: List[BaseMessage], last_only: bool = False) -> Optional[str]:
+def extract_order_id_from_context(messages: List[BaseMessage]) -> Optional[str]:
     """
-    Extracts mentioned order ID.
-    Prefers the latest user turn. If last_only is False, inspects recent user turns.
+    Extracts order ID mentioned in context.
+    Strictly checks user messages, never assistant messages.
+    If the latest user message asks for a general listing, policy FAQ, or greeting,
+    does NOT look back into past turns to avoid sticky context pollution.
     """
     if not messages:
         return None
 
-    # First check the latest user message
-    last_content = messages[-1].content if hasattr(messages[-1], "content") else str(messages[-1])
-    order_id = extract_order_id_from_text(last_content)
-    if order_id or last_only:
+    # Inspect human messages only
+    user_messages = [
+        m for m in messages
+        if isinstance(m, HumanMessage) or getattr(m, "type", "") == "human"
+    ]
+    if not user_messages:
+        return None
+
+    latest_content = user_messages[-1].content if hasattr(user_messages[-1], "content") else str(user_messages[-1])
+    order_id = extract_order_id_from_text(latest_content)
+    if order_id:
         return order_id
 
-    # If the user is responding to a clarification prompt, check the previous 2 turns
-    for msg in reversed(messages[-3:]):
+    # If user message is general query, listing, or FAQ, do NOT look back to old order IDs
+    latest_lower = latest_content.lower()
+    if any(k in latest_lower for k in [
+        "list", "my order", "all order", "show order", "history", "purchases",
+        "bought", "policy", "warranty", "shipping", "faq", "hello", "hi", "help"
+    ]):
+        return None
+
+    # Only look back to recent human turn if user is answering a clarification prompt (e.g. "cancel it", "the broken one", "refund please")
+    for msg in reversed(user_messages[:-1]):
         content = msg.content if hasattr(msg, "content") else str(msg)
         found = extract_order_id_from_text(content)
         if found:
             return found
+
     return None
 
 
@@ -334,10 +377,25 @@ async def conversational_response_node(state: ResolveOpsState) -> Dict[str, Any]
 
     # Construct context evidence block
     orders_list = cust_data.get("recent_orders", [])
-    orders_text = "\n".join([
-        f"- Order ID: {o['order_id']} | Total: ${o['total']:.2f} | Status: {o['status']} | Date: {o.get('date', 'N/A')} | Tracking: {o.get('tracking_number', 'N/A')} | Return Eligible: {o.get('is_return_eligible')}"
+    orders_summary = "\n".join([
+        f"- Order {o['order_id']}: ${o['total']:.2f} | Status: {o['status']} | Date: {o.get('date', 'N/A')} | Items: {', '.join([str(it) for it in o['items']]) if o.get('items') else 'Standard Merchandise'} | Tracking: {o.get('tracking_number', 'N/A')} | Return Eligible: {o.get('is_return_eligible')}"
         for o in orders_list
     ]) if orders_list else "No past orders found under this account."
+
+    order_lookup_info = "None requested."
+    if order_data:
+        if order_data.get("found"):
+            order_lookup_info = (
+                f"Order ID: {order_data.get('order_id')}\n"
+                f"Status: {order_data.get('status')}\n"
+                f"Total: ${order_data.get('order_total', 0.0):.2f}\n"
+                f"Items: {order_data.get('items', [])}\n"
+                f"Tracking: {order_data.get('tracking_number', 'N/A')}\n"
+                f"Return Eligible: {order_data.get('is_return_eligible')}\n"
+                f"Delivered Date: {order_data.get('delivered_date', 'N/A')}"
+            )
+        else:
+            order_lookup_info = f"Order '{order_data.get('order_id')}' was not found under customer account {state['customer_id']}."
 
     evidence_context = f"""
 [Customer Account Profile]
@@ -348,7 +406,7 @@ Trust Score: {cust_data.get('trust_score', 0.95)}
 Total Orders: {cust_data.get('total_orders', 0)}
 
 [Customer Registered Orders in Database]
-{orders_text}
+{orders_summary}
 
 [Active Business Policy from Database]
 Title: {policy_data.get('title', 'Standard Policy')}
@@ -356,8 +414,8 @@ Policy Details: {policy_data.get('content', 'Refunds permitted within 30 days of
 Auto-Approval Limit: ${policy_data.get('max_automated_limit', 100.0):.2f}
 Return Window: {policy_data.get('return_window_days', 30)} days
 
-[Specific Order Lookup (if requested)]
-{order_data if order_data else 'None requested or order does not belong to this customer account.'}
+[Specific Order Lookup Result]
+{order_lookup_info}
 """
 
     response_text = None
@@ -370,48 +428,113 @@ Return Window: {policy_data.get('return_window_days', 30)} days
                 SystemMessage(content=f"REAL-TIME EVIDENCE CONTEXT:\n{evidence_context}"),
             ] + list(state["messages"][-4:])
             ai_msg = await llm.ainvoke(messages)
-            response_text = ai_msg.content.strip()
+            response_text = extract_text_from_message(ai_msg)
         except Exception as exc:
             logger.warning(f"LLM generation failed: {exc}. Attempting fallback model...")
             if fallback_llm:
                 try:
                     fallback_msg = await fallback_llm.ainvoke(messages)
-                    response_text = fallback_msg.content.strip()
+                    response_text = extract_text_from_message(fallback_msg)
                 except Exception:
                     pass
 
-    # 2. Resilient Deterministic Fallback if Model Call is Unavailable
+    # 2. Context-Aware Resilient Fallback (Zero Generic Wall-of-Text Dumping)
     if not response_text:
         last_lower = last_msg.lower()
-        if any(k in last_lower for k in ["list", "my orders", "all orders", "show orders", "purchases"]):
-            if orders_list:
-                orders_summary = "\n".join([
-                    f"- {o['order_id']}: ${o['total']:.2f} | Status: {o['status']} | Tracking: {o.get('tracking_number', 'N/A')}"
-                    for o in orders_list
-                ])
-                response_text = f"Here are the orders associated with your account:\n\n{orders_summary}\n\nPlease let me know if you would like to track, return, or resolve any of these purchases."
+        target_order = extract_order_id_from_context(list(state.get("messages", [])))
+
+        # Format orders summary for reference
+        orders_display = "\n".join([
+            f"- Order {o['order_id']}: ${o['total']:.2f} ({o['status']}) | Tracking: {o.get('tracking_number', 'N/A')}"
+            for o in orders_list
+        ]) if orders_list else "No active orders found on file."
+
+        # Scenario 1: Order Cancellation Request
+        if any(k in last_lower for k in ["cancel"]):
+            if target_order:
+                if order_data and order_data.get("found"):
+                    current_status = order_data.get("status", "").upper()
+                    if current_status == "PROCESSING":
+                        cancel_res = await execute_order_cancellation(order_id=target_order, customer_id=state["customer_id"])
+                        if cancel_res.get("success"):
+                            response_text = (
+                                f"Order {target_order} was in PROCESSING status and has been successfully canceled. "
+                                f"Because it had not yet shipped, your payment of ${order_data.get('order_total', 0.0):.2f} "
+                                f"has been voided and refunded to your original payment method."
+                            )
+                        else:
+                            response_text = cancel_res.get("reason")
+                    elif current_status in ["CANCELED", "CANCELLED"]:
+                        response_text = f"Order {target_order} has already been canceled. No further cancellation action is needed."
+                    elif current_status == "REFUNDED":
+                        response_text = f"Order {target_order} has already been refunded in full."
+                    elif current_status == "SHIPPED":
+                        response_text = (
+                            f"Order {target_order} has already shipped (Tracking: {order_data.get('tracking_number', 'N/A')}). "
+                            f"Orders in transit cannot be intercepted or canceled while en route. "
+                            f"Once your package arrives, you may initiate a return within {policy_data.get('return_window_days', 30)} days."
+                        )
+                    elif current_status == "DELIVERED":
+                        deliv_str = f" on {order_data.get('delivered_date')}" if order_data.get('delivered_date') else ""
+                        response_text = (
+                            f"Order {target_order} was delivered{deliv_str} and can no longer be canceled directly. "
+                            f"If you wish to return your items, you may initiate a return or refund claim under our standard store policy."
+                        )
+                    else:
+                        response_text = f"Order {target_order} is currently in {current_status} status and cannot be canceled directly."
+                else:
+                    response_text = f"We could not locate order '{target_order}' under your account ({cust_data.get('name', 'Customer')}).\n\nYour active orders on file are:\n{orders_display}\n\nPlease verify your order number so I can assist you."
             else:
-                response_text = "We did not find any recent orders associated with your account. Please check the account number or provide an Order ID."
-        elif any(k in last_lower for k in ["track", "where is"]):
-            if order_data and order_data.get("found"):
-                response_text = f"Order {order_data['order_id']} is currently {order_data['status']}. Tracking Number: {order_data.get('tracking_number', 'N/A')}. Delivered: {order_data.get('delivered_date', 'In Transit')}."
+                response_text = f"To cancel an order, please specify your Order ID. Orders can be canceled immediately while in PROCESSING status before shipment.\n\nYour recent orders:\n{orders_display}"
+
+        # Scenario 2: Order Tracking / Status Request
+        elif any(k in last_lower for k in ["track", "where is", "delivery status", "package", "tracking"]):
+            if target_order and order_data and order_data.get("found"):
+                delivered_val = order_data.get('delivered_date') or "In Transit"
+                tracking_val = order_data.get('tracking_number') or "N/A"
+                response_text = f"Order {order_data['order_id']} is currently {order_data['status']}. Total: ${order_data.get('order_total', 0.0):.2f}. Tracking Number: {tracking_val}. Delivery Status: {delivered_val}."
+            elif target_order:
+                response_text = f"We could not locate order '{target_order}' under your account.\n\nYour registered orders are:\n{orders_display}"
             elif orders_list:
                 latest = orders_list[0]
-                response_text = f"Your most recent order {latest['order_id']} is {latest['status']} with tracking number {latest.get('tracking_number', 'N/A')}."
+                response_text = f"Here is the status of your recent orders:\n\n{orders_display}\n\nYour most recent order {latest['order_id']} is {latest['status']} with tracking number {latest.get('tracking_number', 'N/A')}."
             else:
-                response_text = "Could you please specify the Order ID you wish to track?"
-        elif any(k in last_lower for k in ["refund", "return", "broken", "damaged"]):
+                response_text = "Could you please specify which Order ID you would like to track?"
+
+        # Scenario 3: Order Listing / Purchases History
+        elif any(k in last_lower for k in ["list", "my orders", "all orders", "show orders", "purchases", "bought", "my purchases"]):
             if orders_list:
-                orders_summary = "\n".join([f"- {o['order_id']} (${o['total']:.2f}, {o['status']})" for o in orders_list[:3]])
+                response_text = f"Here are the orders associated with your account ({cust_data.get('name', 'Customer')}):\n\n{orders_display}\n\nPlease let me know if you would like to track, return, or cancel any of these purchases."
+            else:
+                response_text = "We did not find any recent orders associated with your account. Please check the account number or provide an Order ID."
+
+        # Scenario 4: Refund / Return Inquiry
+        elif any(k in last_lower for k in ["refund", "return", "broken", "damaged", "money back", "defective"]):
+            if target_order and order_data and not order_data.get("found"):
+                response_text = f"We could not locate order '{target_order}' under your account. Please check your order ID from your orders list:\n\n{orders_display}"
+            elif target_order and order_data and not order_data.get("is_return_eligible"):
+                response_text = f"Order {target_order} was delivered outside our {policy_data.get('return_window_days', 30)}-day return eligibility window. Under store policy, automated refunds cannot be processed for expired orders."
+            elif orders_list:
+                orders_preview = "\n".join([f"- {o['order_id']} (${o['total']:.2f}, {o['status']})" for o in orders_list[:3]])
                 response_text = (
                     f"I can help you with your return or refund request. To make sure I assist with the correct purchase, "
-                    f"could you please specify which order you would like to resolve?\n\nHere are your recent orders:\n{orders_summary}\n\n"
+                    f"could you please specify which order you would like to resolve?\n\nHere are your recent orders:\n{orders_preview}\n\n"
                     f"Please reply with the Order ID (e.g. {orders_list[0]['order_id']}) and the reason."
                 )
             else:
                 response_text = "I can assist you with your refund inquiry. Could you please provide your Order ID and a description of the issue?"
+
+        # Scenario 5: Policy Inquiries (Returns, Warranty, Shipping)
+        elif any(k in last_lower for k in ["warranty"]):
+            response_text = "All electronics and hardware products include a 1-year limited manufacturer warranty covering repairs or replacements for hardware defects."
+        elif any(k in last_lower for k in ["shipping", "transit", "ship"]):
+            response_text = "Orders typically arrive within 3-5 business days. If a shipment shows no tracking progression for more than 7 business days, our team can initiate a carrier trace or replacement."
+        elif any(k in last_lower for k in ["policy", "return window", "restocking"]):
+            response_text = f"Our standard return policy allows items to be returned within {policy_data.get('return_window_days', 30)} days of delivery for damaged or defective goods. Unopened items in original packaging qualify for return within 14 days."
+
+        # Scenario 6: Greetings & General Assistance
         else:
-            response_text = f"{policy_data.get('title', 'Resolution Policy')}:\n\n{policy_data.get('content', 'Refunds and returns are supported within 30 days of delivery.')}"
+            response_text = f"Hello {cust_data.get('name', 'there')}, I am your ResolveOps support assistant. I can help you view your orders, track shipments, cancel processing orders, or process returns and refunds. How can I help you today?"
 
     return {"messages": [AIMessage(content=response_text)]}
 

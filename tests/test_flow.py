@@ -171,3 +171,67 @@ async def test_healthz_and_probes():
             res = await client.get("/healthz")
             assert res.status_code == 200
             assert res.json()["status"] == "LIVE"
+
+
+@pytest.mark.asyncio
+async def test_order_cancellation_nonexistent_order_no_generic_dump():
+    """
+    Test 7: Asking to cancel a non-existent order (e.g. ORD-1093) does NOT dump
+    the generic raw policy text, but reports the order is not found and lists valid orders.
+    """
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post(
+                "/v1/chat/message",
+                json={
+                    "message": "i want to cancel the order ORD-1093",
+                    "customer_id": "CUST-1001"
+                }
+            )
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "COMPLETED"
+            # Must NOT dump raw policy heading or text
+            assert "General Defective & Damaged Goods Refund Policy" not in data["reply"]
+            # Must inform user that the order was not located or explain how to proceed
+            assert "ORD-1093" in data["reply"]
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_switch_from_order_to_order_listing():
+    """
+    Test 8: User in same thread mentions an unknown order, and then asks
+    'list down all my orders'. Agent MUST list orders and NOT respond with
+    'Authorization Denied'.
+    """
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # Turn 1: User mentions an order not belonging to them
+            res1 = await client.post(
+                "/v1/chat/message",
+                json={
+                    "message": "i want to cancel the order ORD-9999",
+                    "customer_id": "CUST-1001"
+                }
+            )
+            assert res1.status_code == 200
+            data1 = res1.json()
+            thread_id = data1["thread_id"]
+
+            # Turn 2: In SAME thread, user asks to list their orders
+            res2 = await client.post(
+                "/v1/chat/message",
+                json={
+                    "message": "list down all my orders",
+                    "customer_id": "CUST-1001",
+                    "thread_id": thread_id
+                }
+            )
+            assert res2.status_code == 200
+            data2 = res2.json()
+            assert data2["status"] == "COMPLETED"
+            assert "Authorization Denied" not in data2["reply"]
+            assert "ORD-" in data2["reply"]
+
