@@ -20,9 +20,9 @@ services:
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-3.5-flash
+        value: gemini-2.0-flash
       - key: GEMINI_FALLBACK_MODEL
-        value: gemini-3.5-flash
+        value: gemini-1.5-flash
 
 databases:
   - name: resolveops-db

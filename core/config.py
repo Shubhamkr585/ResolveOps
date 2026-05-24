@@ -34,8 +34,8 @@ class Settings(BaseSettings):
 
     # AI Model Providers
     GEMINI_API_KEY: Optional[str] = Field(default=None, description="Google Gemini API key")
-    GEMINI_MODEL: str = Field(default="gemini-3.5-flash", description="Primary agent LLM model identifier")
-    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-3.5-flash", description="Fallback LLM for resilience")
+    GEMINI_MODEL: str = Field(default="gemini-2.0-flash", description="Primary agent LLM model identifier")
+    GEMINI_FALLBACK_MODEL: str = Field(default="gemini-1.5-flash", description="Fallback LLM for resilience")
 
     # Business Rules Defaults (Overridden dynamically by PostgreSQL policies)
     MAX_AUTO_REFUND_LIMIT_DEFAULT: float = Field(default=100.0, description="Fallback auto-approval limit")
