@@ -27,5 +27,6 @@ services:
 databases:
   - name: resolveops-db
     databaseName: resolveops
-    user: postgres
+    user: resolveops_user
+    region: oregon
     plan: free
