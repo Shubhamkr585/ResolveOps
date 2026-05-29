@@ -280,9 +280,10 @@ async def triage_node(state: ResolveOpsState) -> Dict[str, Any]:
 async def context_loader_node(state: ResolveOpsState, *, store: Optional[BaseStore] = None) -> Dict[str, Any]:
     with ExecutionTimer() as timer:
         customer_memory = await MemoryManager.retrieve_long_term_memory(store, state["customer_id"])
-        pruned_messages, rolling_summary = MemoryManager.apply_context_window_budget(
+        pruned_messages, rolling_summary = await MemoryManager.apply_context_window_budget(
             list(state["messages"]),
-            state.get("summary")
+            state.get("summary"),
+            llm=llm
         )
 
     AuditLogger.log_event(

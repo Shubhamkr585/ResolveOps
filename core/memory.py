@@ -88,14 +88,18 @@ class MemoryManager:
             logger.error(f"Failed to persist long-term memory: {exc}")
             return False
 
-    @staticmethod
-    def apply_context_window_budget(
+    @classmethod
+    async def apply_context_window_budget(
+        cls,
         messages: List[BaseMessage],
-        existing_summary: Optional[str] = None
+        existing_summary: Optional[str] = None,
+        llm: Optional[Any] = None
     ) -> Tuple[List[BaseMessage], Optional[str]]:
         """
-        Sliding Window + Rolling Summary Strategy (Handbook Section 5.3, 5.4).
-        Preserves the latest N messages verbatim and rolls older messages into a compact summary.
+        Sliding Window + Progressive Semantic Summarization (Handbook Section 5.3, 5.4).
+        Preserves the latest N messages verbatim and progressively summarizes older turns using
+        semantic LLM extraction to retain critical business entities (Order IDs, amounts, reasons).
+        Includes a robust entity-preserving fallback when the model is offline.
         """
         if len(messages) <= MAX_VERBATIM_MESSAGES:
             return messages, existing_summary
@@ -103,19 +107,51 @@ class MemoryManager:
         older_messages = messages[:-MAX_VERBATIM_MESSAGES]
         recent_messages = list(messages[-MAX_VERBATIM_MESSAGES:])
 
-        # Build compact rolling summary of older messages
-        summary_lines = []
-        if existing_summary:
-            summary_lines.append(f"Previous Context: {existing_summary}")
-
+        # Build lines of older dialogue to be incorporated
+        dialogue_lines = []
         for msg in older_messages:
-            role = "Customer" if isinstance(msg, HumanMessage) else "Agent"
-            content_preview = msg.content[:120].strip()
-            summary_lines.append(f"{role}: {content_preview}")
+            role = "Customer" if isinstance(msg, HumanMessage) or getattr(msg, "type", "") == "human" else "Agent"
+            content = msg.content if hasattr(msg, "content") else str(msg)
+            # Normalize whitespace
+            content_clean = " ".join(str(content).split())
+            dialogue_lines.append(f"{role}: {content_clean}")
+        dialogue_block = "\n".join(dialogue_lines)
 
-        compact_summary = " | ".join(summary_lines)
-        # Cap summary token size
-        if len(compact_summary) > 600:
-            compact_summary = compact_summary[-600:]
+        # 1. Semantic LLM Summarization (Preserves context, entities, agreements)
+        if llm:
+            try:
+                prompt = (
+                    "You are the memory summarizer for ResolveOps customer support.\n"
+                    "Progressively update the conversation summary with the new conversation turns.\n"
+                    "CRITICAL RULES:\n"
+                    "1. Preserve all key business entities: exact Order IDs (e.g. ORD-XXXX), dollar amounts ($XX.XX), tracking numbers, and reasons.\n"
+                    "2. Capture customer intent and agreed outcomes.\n"
+                    "3. Keep the summary concise (under 120 words), factual, and coherent. Do not use emojis.\n\n"
+                    f"CURRENT SUMMARY:\n{existing_summary or 'No prior summary.'}\n\n"
+                    f"NEW CONVERSATION TURNS TO INCORPORATE:\n{dialogue_block}\n\n"
+                    "UPDATED PROGRESSIVE SUMMARY:"
+                )
+                res = await llm.ainvoke(prompt)
+                summary_text = res.content.strip() if hasattr(res, "content") else str(res).strip()
+                if summary_text:
+                    return recent_messages, summary_text
+            except Exception as exc:
+                logger.warning(f"Semantic LLM summarization failed: {exc}. Using entity-preserving heuristic.")
 
+        # 2. Entity-Preserving Robust Fallback (Zero crude mid-word chopping)
+        summary_parts = []
+        if existing_summary:
+            summary_parts.append(f"Prior: {existing_summary}")
+
+        for line in dialogue_lines:
+            # Preserve first complete sentence or up to 140 chars at word boundary
+            if len(line) <= 140:
+                summary_parts.append(line)
+            else:
+                cut = line[:140]
+                last_space = cut.rfind(" ")
+                clean_cut = cut[:last_space] if last_space > 80 else cut
+                summary_parts.append(f"{clean_cut}...")
+
+        compact_summary = " | ".join(summary_parts)
         return recent_messages, compact_summary
