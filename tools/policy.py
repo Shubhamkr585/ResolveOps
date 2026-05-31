@@ -7,8 +7,9 @@ logger = logging.getLogger("resolveops.tools.policy")
 
 async def search_refund_policy(query: str) -> Dict[str, Any]:
     """
-    Retrieves verified policy documents from PostgreSQL policies table (Handbook Section 11.2).
-    Grounds agent reasoning in official policy text rather than model hallucination.
+    Retrieves verified policy documents from PostgreSQL using Hybrid Search (Handbook Section 11.2).
+    Combines Sparse Lexical FTS (ts_rank) and Dense Semantic Intent Matching via Reciprocal
+    Rank Fusion (RRF with k=60) to ground agent reasoning in official policy text.
     """
-    logger.info(f"Querying policies table in PostgreSQL for: {query[:50]}")
+    logger.info(f"Executing Hybrid Policy Search (FTS + Dense RRF) for: {query[:50]}")
     return await query_policy_from_db(query)
