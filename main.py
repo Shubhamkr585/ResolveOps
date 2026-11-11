@@ -30,7 +30,7 @@ from api.routes import router as webhook_router
 from api.chat_routes import router as chat_router
 from core.graph import build_resolveops_graph
 
-DB_URI = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/resolveops")
+DB_URI = os.getenv("DATABASE_URL", "postgresql://postgres:postgrespassword@localhost:5433/resolveops")
 
 
 @asynccontextmanager
