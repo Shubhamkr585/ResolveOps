@@ -1,0 +1,20 @@
+# LangGraph, LangChain core & model providers
+langgraph
+langchain-core
+langgraph-checkpoint-postgres
+langchain-openai
+pydantic
+
+# FastAPI, ASGI server, and HTTP tools
+fastapi
+uvicorn
+httpx
+
+# Database, Checkpointing & Async drivers
+psycopg[binary,pool]
+redis
+
+# Testing & Dev tooling
+pytest
+pytest-asyncio
+python-dotenv
