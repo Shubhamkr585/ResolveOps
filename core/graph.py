@@ -3,8 +3,6 @@ import re
 import uuid
 import logging
 from typing import Dict, Any, Literal, Optional, List
-from dotenv import load_dotenv
-
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, BaseMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.types import interrupt
@@ -12,6 +10,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.base import BaseStore
 
+from core.config import get_settings
 from core.state import ResolveOpsState, TriageDecision, PendingAction
 from core.decorators import LockAcquisitionError, ActionInProgressError
 from core.guardrails import sanitize_and_check_injection, validate_refund_policy
@@ -22,28 +21,24 @@ from tools.policy import search_refund_policy
 from tools.refund import process_refund_tool
 
 logger = logging.getLogger("resolveops.graph")
-load_dotenv()
+settings = get_settings()
 
 # Model Configuration with Resilience Defaults (Handbook Section 8.3)
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
-
 llm = ChatGoogleGenerativeAI(
-    model=PRIMARY_MODEL,
+    model=settings.GEMINI_MODEL,
     temperature=0,
-    google_api_key=gemini_api_key,
-    timeout=12,
+    google_api_key=settings.GEMINI_API_KEY,
+    timeout=settings.LLM_TIMEOUT_SECONDS,
     max_retries=1
-) if gemini_api_key else None
+) if settings.GEMINI_API_KEY else None
 
 fallback_llm = ChatGoogleGenerativeAI(
-    model=FALLBACK_MODEL,
+    model=settings.GEMINI_FALLBACK_MODEL,
     temperature=0,
-    google_api_key=gemini_api_key,
-    timeout=12,
+    google_api_key=settings.GEMINI_API_KEY,
+    timeout=settings.LLM_TIMEOUT_SECONDS,
     max_retries=1
-) if gemini_api_key and PRIMARY_MODEL != FALLBACK_MODEL else None
+) if settings.GEMINI_API_KEY and settings.GEMINI_MODEL != settings.GEMINI_FALLBACK_MODEL else None
 
 TRIAGE_PROMPT = """You are the triage supervisor for an e-commerce resolution system.
 Analyze the user dialogue and classify intent into exactly one category:
@@ -80,8 +75,9 @@ def extract_explicit_refund_amount(text: str) -> Optional[float]:
 
 
 def heuristic_triage(state: ResolveOpsState) -> TriageDecision:
+    """Deterministic fallback triage when LLM is unavailable or times out."""
     last_msg = state["messages"][-1].content.lower() if state.get("messages") else ""
-    if any(k in last_msg for k in ["refund", "money", "broken", "damaged", "return"]):
+    if any(k in last_msg for k in ["refund", "money", "broken", "damaged", "return", "chargeback"]):
         return TriageDecision(
             route="billing_refund",
             sentiment_score=-0.5,
@@ -144,7 +140,7 @@ async def triage_node(state: ResolveOpsState) -> Dict[str, Any]:
                     [SystemMessage(content=TRIAGE_PROMPT)] + list(state["messages"])
                 )
             except Exception as exc:
-                logger.warning(f"Primary model '{PRIMARY_MODEL}' failed: {exc}. Attempting fallback...")
+                logger.warning(f"Primary model '{settings.GEMINI_MODEL}' failed: {exc}. Attempting fallback...")
                 if fallback_llm:
                     try:
                         fallback_structured = fallback_llm.with_structured_output(TriageDecision)
@@ -178,10 +174,7 @@ async def triage_node(state: ResolveOpsState) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 async def context_loader_node(state: ResolveOpsState, *, store: Optional[BaseStore] = None) -> Dict[str, Any]:
     with ExecutionTimer() as timer:
-        # 1. Retrieve persistent customer records from cross-thread Store
         customer_memory = await MemoryManager.retrieve_long_term_memory(store, state["customer_id"])
-
-        # 2. Apply context-window sliding budget and summary compression
         pruned_messages, rolling_summary = MemoryManager.apply_context_window_budget(
             list(state["messages"]),
             state.get("summary")
@@ -239,7 +232,7 @@ async def investigation_node(state: ResolveOpsState) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Conditional Branch after Investigation: Check Information Completeness (Handbook Page 16)
+# Conditional Branch after Investigation
 # ---------------------------------------------------------------------------
 def check_investigation_sufficiency(state: ResolveOpsState) -> Literal["ask_clarifying", "policy_rag", "order_ineligible", "order_not_found", "propose_resolution", "security_abort"]:
     if state.get("escalation_reason") == "Prompt injection attempt detected.":
@@ -249,12 +242,9 @@ def check_investigation_sufficiency(state: ResolveOpsState) -> Literal["ask_clar
         return "policy_rag"
 
     order_id = extract_order_id_from_messages(list(state.get("messages", [])))
-
-    # If customer did NOT provide an order ID, agent must clarify rather than hallucinating an action
     if not order_id:
         return "ask_clarifying"
 
-    # Inspect order evidence from database
     evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
     order_data = evidence_map.get("get_order_details", {})
 
@@ -268,7 +258,7 @@ def check_investigation_sufficiency(state: ResolveOpsState) -> Literal["ask_clar
 
 
 # ---------------------------------------------------------------------------
-# Node 5a: Clarification Node (Handbook Page 16: "need info -> ask_clarifying")
+# Node 5a: Clarification Node
 # ---------------------------------------------------------------------------
 async def ask_clarifying_node(state: ResolveOpsState) -> Dict[str, Any]:
     evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
@@ -278,12 +268,14 @@ async def ask_clarifying_node(state: ResolveOpsState) -> Dict[str, Any]:
     if recent_orders:
         orders_summary = "\n".join([f"- {o['order_id']} (${o['total']:.2f}, {o['status']})" for o in recent_orders[:3]])
         reply = (
-            f"I can help you with your refund or return. To proceed, could you please specify which order you would like to request a refund for? "
-            f"Here are your recent orders:\n{orders_summary}\n\nPlease reply with the Order ID (e.g. {recent_orders[0]['order_id']}) and the reason."
+            f"I can help you with your refund or return request. To make sure I assist with the correct purchase, "
+            f"could you please specify which order you would like to resolve?\n\n"
+            f"Here are your recent orders:\n{orders_summary}\n\n"
+            f"Please reply with the Order ID (e.g. {recent_orders[0]['order_id']}) and the reason."
         )
     else:
         reply = (
-            "I can assist you with your refund inquiry. Could you please provide your Order ID (for example, ORD-9821) "
+            "I can assist you with your refund inquiry. Could you please provide your Order ID "
             "and a brief description of the issue?"
         )
 
@@ -291,7 +283,7 @@ async def ask_clarifying_node(state: ResolveOpsState) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Node 5b: Order Not Found / Policy Ineligible Nodes (Handbook Page 16)
+# Node 5b: Order Not Found / Policy Ineligible Nodes
 # ---------------------------------------------------------------------------
 async def order_not_found_node(state: ResolveOpsState) -> Dict[str, Any]:
     order_id = extract_order_id_from_messages(list(state.get("messages", []))) or "your order"
@@ -305,34 +297,32 @@ async def order_ineligible_node(state: ResolveOpsState) -> Dict[str, Any]:
     order_id = extract_order_id_from_messages(list(state.get("messages", []))) or "your order"
     evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
     policy_data = evidence_map.get("search_refund_policy", {})
-    window = policy_data.get("return_window_days", 30)
+    window = policy_data.get("return_window_days", settings.RETURN_WINDOW_DAYS_DEFAULT)
 
     reply = (
         f"Order '{order_id}' is outside our {window}-day return eligibility window. "
-        f"Under company policy ({policy_data.get('title', 'Refund Policy')}), automated refunds cannot be processed for expired orders."
+        f"Under company policy ({policy_data.get('title', 'Resolution Policy')}), automated refunds cannot be processed for expired orders."
     )
     return {"messages": [AIMessage(content=reply)]}
 
 
 # ---------------------------------------------------------------------------
-# Node 5c: Resolution Planner (Handbook Section 7.3, 11.2)
+# Node 5c: Resolution Planner
 # ---------------------------------------------------------------------------
 async def resolution_planner_node(state: ResolveOpsState) -> Dict[str, Any]:
     last_msg = state["messages"][-1].content if state.get("messages") else ""
-    order_id = extract_order_id_from_messages(list(state.get("messages", []))) or "ORD-9821"
+    order_id = extract_order_id_from_messages(list(state.get("messages", [])))
 
     evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
     order_data = evidence_map.get("get_order_details", {})
-    order_total = order_data.get("order_total", 120.0)
+    order_total = float(order_data.get("order_total", 0.0))
 
     explicit_amount = extract_explicit_refund_amount(last_msg)
     if explicit_amount is not None:
         refund_amount = min(explicit_amount, order_total)
     else:
-        # Default to full order refund if amount wasn't specified
         refund_amount = order_total
 
-    # Derive reason from customer text
     reason = "Customer requested refund"
     if "broken" in last_msg.lower() or "damaged" in last_msg.lower():
         reason = "Item arrived damaged/broken"
@@ -343,7 +333,7 @@ async def resolution_planner_node(state: ResolveOpsState) -> Dict[str, Any]:
     action = PendingAction(
         action_id=idempotency_key,
         action_type="refund_order",
-        entity_id=order_id,
+        entity_id=order_id or "UNKNOWN",
         amount=refund_amount,
         reason=reason,
         metadata={"customer_id": state["customer_id"], "order_total": order_total}
@@ -353,15 +343,19 @@ async def resolution_planner_node(state: ResolveOpsState) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Routing Guard: Escalation & Policy Guard (Handbook Section 8.4)
+# Routing Guard: Escalation & Policy Guard (Dynamic Threshold from DB Policy)
 # ---------------------------------------------------------------------------
 def check_escalation_guard(state: ResolveOpsState) -> Literal["suspend_for_hitl", "execute_mutation"]:
     action = state.get("pending_action")
     if not action:
         return "execute_mutation"
 
-    # Business Rule: Transactions > $100.00 MUST require supervisor sign-off
-    if action.action_type == "refund_order" and action.amount > 100.0:
+    evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
+    policy_data = evidence_map.get("search_refund_policy", {})
+    policy_limit = float(policy_data.get("max_automated_limit", settings.MAX_AUTO_REFUND_LIMIT_DEFAULT))
+
+    # Business Rule: Transactions exceeding policy limit require human supervisor sign-off
+    if action.action_type == "refund_order" and action.amount > policy_limit:
         return "suspend_for_hitl"
 
     if state.get("is_escalated", False):
@@ -371,10 +365,14 @@ def check_escalation_guard(state: ResolveOpsState) -> Literal["suspend_for_hitl"
 
 
 # ---------------------------------------------------------------------------
-# Node 6: Human-in-the-Loop Suspension (Handbook Section 8.1, 8.2)
+# Node 6: Human-in-the-Loop Suspension
 # ---------------------------------------------------------------------------
 def hitl_suspension_node(state: ResolveOpsState) -> Dict[str, Any]:
     action = state["pending_action"]
+    evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
+    policy_data = evidence_map.get("search_refund_policy", {})
+    policy_limit = float(policy_data.get("max_automated_limit", settings.MAX_AUTO_REFUND_LIMIT_DEFAULT))
+
     human_approval = interrupt({
         "type": "MUTATION_APPROVAL_REQUIRED",
         "action_id": action.action_id,
@@ -383,7 +381,11 @@ def hitl_suspension_node(state: ResolveOpsState) -> Dict[str, Any]:
         "entity_id": action.entity_id,
         "reason": action.reason,
         "customer_id": state["customer_id"],
-        "message": f"Your refund request for order {action.entity_id} (${action.amount:.2f}) exceeds our automated approval limit ($100.00) and has been submitted to a human supervisor for review."
+        "policy_limit": policy_limit,
+        "message": (
+            f"Your refund request for order {action.entity_id} (${action.amount:.2f}) exceeds our automated "
+            f"approval limit (${policy_limit:.2f}) and has been submitted to a human supervisor for review."
+        )
     })
     return {
         "admin_approval_status": human_approval.get("status", "REJECTED"),
@@ -392,13 +394,13 @@ def hitl_suspension_node(state: ResolveOpsState) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Node 7: Action Executor (Handbook Section 6.5, 10.1)
+# Node 7: Action Executor (PostgreSQL Mutation + Redis Locks)
 # ---------------------------------------------------------------------------
 async def tool_execution_node(state: ResolveOpsState) -> Dict[str, Any]:
     if state.get("admin_approval_status") == "REJECTED":
         return {
             "action_results": [{"status": "ABORTED", "message": "Transaction rejected by supervisor."}],
-            "messages": [AIMessage(content="Your refund exceeds auto-approval limits and was declined by management.")]
+            "messages": [AIMessage(content="Your refund exceeds auto-approval limits and was declined by supervisor review.")]
         }
 
     action = state["pending_action"]
@@ -408,7 +410,8 @@ async def tool_execution_node(state: ResolveOpsState) -> Dict[str, Any]:
                 order_id=action.entity_id,
                 action_id=action.action_id,
                 amount=action.amount,
-                reason=action.reason
+                reason=action.reason,
+                customer_id=state["customer_id"]
             )
             AuditLogger.log_event(
                 event_type="TRANSACTIONAL_TOOL_EXECUTED",
@@ -419,27 +422,34 @@ async def tool_execution_node(state: ResolveOpsState) -> Dict[str, Any]:
             )
             return {
                 "action_results": [res],
-                "messages": [AIMessage(content=f"Successfully refunded ${action.amount:.2f} for order {action.entity_id}.")]
+                "messages": [AIMessage(content=f"Successfully refunded ${action.amount:.2f} for order {action.entity_id}. Transaction ID: {res.get('transaction_id')}.")]
             }
         except LockAcquisitionError:
             return {"error_trace": "Resource contention lock held."}
         except ActionInProgressError:
             return {"error_trace": "Duplicate in-flight execution."}
+        except Exception as exc:
+            logger.error(f"Tool execution failed: {exc}")
+            return {
+                "action_results": [{"status": "FAILED", "error": str(exc)}],
+                "messages": [AIMessage(content=f"An error occurred while processing refund: {str(exc)}")]
+            }
 
 
 # ---------------------------------------------------------------------------
-# Node 8: Policy RAG Response (Handbook Section 7.2)
+# Node 8: Policy RAG Response (Full-Text Search Grounded)
 # ---------------------------------------------------------------------------
 async def policy_rag_node(state: ResolveOpsState) -> Dict[str, Any]:
     last_msg = state["messages"][-1].content if state.get("messages") else ""
     policy_info = await search_refund_policy(last_msg)
-    policy_text = policy_info.get("content") or policy_info.get("text") or "Standard policy applies."
-    response_text = f"Policy Information: {policy_text}"
+    title = policy_info.get("title", "Policy Information")
+    policy_text = policy_info.get("content", "Standard resolution policy applies.")
+    response_text = f"**{title}**\n\n{policy_text}"
     return {"messages": [AIMessage(content=response_text)]}
 
 
 # ---------------------------------------------------------------------------
-# Node 9: Verifier & Long-Term Memory Updater (Handbook Section 4.5, 11.2)
+# Node 9: Verifier & Long-Term Memory Updater
 # ---------------------------------------------------------------------------
 async def verifier_and_memory_node(state: ResolveOpsState, *, store: Optional[BaseStore] = None) -> Dict[str, Any]:
     action_results = state.get("action_results", [])
@@ -461,7 +471,7 @@ async def verifier_and_memory_node(state: ResolveOpsState, *, store: Optional[Ba
 
 
 # ---------------------------------------------------------------------------
-# StateGraph Assembly (Handbook Section 2.2, 11.2)
+# StateGraph Assembly
 # ---------------------------------------------------------------------------
 def build_resolveops_graph(checkpointer: AsyncPostgresSaver, store: Optional[BaseStore] = None):
     workflow = StateGraph(ResolveOpsState)
@@ -485,7 +495,6 @@ def build_resolveops_graph(checkpointer: AsyncPostgresSaver, store: Optional[Bas
     workflow.add_edge("triage", "context_loader")
     workflow.add_edge("context_loader", "investigation")
 
-    # Conditional Branch after investigation (Handbook Page 16)
     workflow.add_conditional_edges(
         "investigation",
         check_investigation_sufficiency,
@@ -499,7 +508,6 @@ def build_resolveops_graph(checkpointer: AsyncPostgresSaver, store: Optional[Bas
         }
     )
 
-    # Resolution planner routes to HITL or execution
     workflow.add_conditional_edges(
         "resolution_planner",
         check_escalation_guard,
