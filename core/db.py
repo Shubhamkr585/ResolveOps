@@ -172,13 +172,26 @@ async def query_customer_history_from_db(customer_id: str) -> Dict[str, Any]:
                 name, email, tier, trust_score, total_orders = cust
 
                 await cur.execute("""
-                    SELECT order_id, status, order_total, order_date, is_return_eligible
+                    SELECT order_id, status, order_total, order_date, is_return_eligible, tracking_number, items
                     FROM orders
                     WHERE customer_id = %s
                     ORDER BY order_date DESC
-                    LIMIT 5;
+                    LIMIT 10;
                 """, (customer_id,))
                 recent_orders = await cur.fetchall()
+
+                formatted_orders = []
+                for r in recent_orders:
+                    items_val = r[6] if isinstance(r[6], list) else json.loads(r[6]) if r[6] else []
+                    formatted_orders.append({
+                        "order_id": r[0],
+                        "status": r[1],
+                        "total": float(r[2]),
+                        "date": r[3].strftime("%Y-%m-%d") if r[3] else None,
+                        "is_return_eligible": bool(r[4]),
+                        "tracking_number": r[5] or "N/A",
+                        "items": items_val
+                    })
 
                 return {
                     "found": True,
@@ -187,16 +200,7 @@ async def query_customer_history_from_db(customer_id: str) -> Dict[str, Any]:
                     "tier": tier,
                     "trust_score": float(trust_score),
                     "total_orders": total_orders,
-                    "recent_orders": [
-                        {
-                            "order_id": r[0],
-                            "status": r[1],
-                            "total": float(r[2]),
-                            "date": r[3].isoformat() if r[3] else None,
-                            "is_return_eligible": bool(r[4])
-                        }
-                        for r in recent_orders
-                    ]
+                    "recent_orders": formatted_orders
                 }
     except Exception as exc:
         logger.error(f"Error querying customer {customer_id}: {exc}")

@@ -26,7 +26,7 @@ settings = get_settings()
 # Model Configuration with Resilience Defaults (Handbook Section 8.3)
 llm = ChatGoogleGenerativeAI(
     model=settings.GEMINI_MODEL,
-    temperature=0,
+    temperature=0.1,
     google_api_key=settings.GEMINI_API_KEY,
     timeout=settings.LLM_TIMEOUT_SECONDS,
     max_retries=1
@@ -34,29 +34,62 @@ llm = ChatGoogleGenerativeAI(
 
 fallback_llm = ChatGoogleGenerativeAI(
     model=settings.GEMINI_FALLBACK_MODEL,
-    temperature=0,
+    temperature=0.1,
     google_api_key=settings.GEMINI_API_KEY,
     timeout=settings.LLM_TIMEOUT_SECONDS,
     max_retries=1
 ) if settings.GEMINI_API_KEY and settings.GEMINI_MODEL != settings.GEMINI_FALLBACK_MODEL else None
 
-TRIAGE_PROMPT = """You are the triage supervisor for an e-commerce resolution system.
+TRIAGE_PROMPT = """You are the triage supervisor for ResolveOps, an autonomous e-commerce customer support engine.
 Analyze the user dialogue and classify intent into exactly one category:
-- 'policy_rag': General questions, return timelines, shipping FAQ.
-- 'order_management': Track, cancel, or modify active order addresses.
-- 'billing_refund': Disputes, refund requests, charging errors.
-- 'human_escalation': Highly abusive speech or legal threats.
+- 'billing_refund': Customer wants a refund, money back, compensation, or dispute for an order or item.
+- 'order_management': Customer wants to view/list their orders ("list down all my orders", "my purchase history"), track packages, check delivery status, or modify/cancel orders.
+- 'policy_rag': Customer is asking about store policies, warranties, returns rules, shipping FAQs, or terms.
+- 'human_escalation': Highly abusive speech or explicit legal threats.
 
 Extract sentiment (-1.0 to 1.0). If sentiment < -0.6, set requires_escalation=True."""
 
+AUTONOMOUS_SYSTEM_PROMPT = """You are ResolveOps Assistant, a professional, empathetic, and highly capable autonomous e-commerce resolution agent.
+You have real-time access to the customer's account records, verified order history, and official store policies retrieved from PostgreSQL.
 
-def extract_order_id_from_messages(messages: List[BaseMessage]) -> Optional[str]:
-    """Scans conversation history in reverse to extract mentioned order ID."""
-    for msg in reversed(messages):
+Core Directives:
+1. Ground every answer in the provided Evidence below (Customer History, Orders, Policies).
+2. If the customer asks to list their orders or asks what they purchased, provide a clean, organized list of their orders with Order ID, Total, Status, Date, Tracking Number, and Items.
+3. If the customer asks to track an order or check delivery status, report the exact status, delivery date, and tracking number.
+4. If the customer wants a refund but did not specify an Order ID, list their recent eligible orders and ask which specific order they want to resolve.
+5. If the customer's order is outside the return window, explain the policy gently and mention the return window limit.
+6. If an order ID belongs to a different customer account, explain that the order was not found under their registered account without exposing other customer data.
+7. Be concise, polite, professional, and helpful. Do NOT use emojis."""
+
+
+def extract_order_id_from_text(text: str) -> Optional[str]:
+    """Extracts explicit order ID mentioned in text."""
+    match = re.search(r"\b(ORD-\d+|[A-Z]{3,4}-\d+)\b", text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+def extract_order_id_from_context(messages: List[BaseMessage], last_only: bool = False) -> Optional[str]:
+    """
+    Extracts mentioned order ID.
+    Prefers the latest user turn. If last_only is False, inspects recent user turns.
+    """
+    if not messages:
+        return None
+
+    # First check the latest user message
+    last_content = messages[-1].content if hasattr(messages[-1], "content") else str(messages[-1])
+    order_id = extract_order_id_from_text(last_content)
+    if order_id or last_only:
+        return order_id
+
+    # If the user is responding to a clarification prompt, check the previous 2 turns
+    for msg in reversed(messages[-3:]):
         content = msg.content if hasattr(msg, "content") else str(msg)
-        match = re.search(r"\b(ORD-\d+|[A-Z]{3,4}-\d+)\b", content, re.IGNORECASE)
-        if match:
-            return match.group(1).upper()
+        found = extract_order_id_from_text(content)
+        if found:
+            return found
     return None
 
 
@@ -77,18 +110,47 @@ def extract_explicit_refund_amount(text: str) -> Optional[float]:
 def heuristic_triage(state: ResolveOpsState) -> TriageDecision:
     """Deterministic fallback triage when LLM is unavailable or times out."""
     last_msg = state["messages"][-1].content.lower() if state.get("messages") else ""
-    if any(k in last_msg for k in ["refund", "money", "broken", "damaged", "return", "chargeback"]):
+
+    # 1. Check for Order Listing / Tracking / Viewing
+    if any(k in last_msg for k in ["list", "my orders", "all orders", "show orders", "past orders", "order history", "purchases", "bought"]):
+        return TriageDecision(
+            route="order_management",
+            sentiment_score=0.1,
+            requires_escalation=False,
+            reason="Customer requested listing or viewing past orders"
+        )
+    if any(k in last_msg for k in ["track", "where is", "delivery status", "package", "tracking", "status"]):
+        return TriageDecision(
+            route="order_management",
+            sentiment_score=0.0,
+            requires_escalation=False,
+            reason="Order tracking or status inquiry"
+        )
+
+    # 2. Check for Billing / Refund disputes
+    if any(k in last_msg for k in ["refund", "money back", "broken", "damaged", "defective", "chargeback", "cancel and refund"]):
         return TriageDecision(
             route="billing_refund",
-            sentiment_score=-0.5,
+            sentiment_score=-0.4,
             requires_escalation=False,
-            reason="Refund or damaged item intent detected (deterministic fallback)"
+            reason="Refund or damaged item dispute detected"
         )
+
+    # 3. Policy questions
+    if any(k in last_msg for k in ["policy", "return window", "warranty", "rule", "terms", "faq", "how do i return", "restocking"]):
+        return TriageDecision(
+            route="policy_rag",
+            sentiment_score=0.1,
+            requires_escalation=False,
+            reason="Policy inquiry detected"
+        )
+
+    # 4. Default
     return TriageDecision(
-        route="policy_rag",
+        route="order_management" if "order" in last_msg else "policy_rag",
         sentiment_score=0.1,
         requires_escalation=False,
-        reason="General inquiry (deterministic fallback)"
+        reason="General dialogue"
     )
 
 
@@ -137,15 +199,15 @@ async def triage_node(state: ResolveOpsState) -> Dict[str, Any]:
             try:
                 structured_llm = llm.with_structured_output(TriageDecision)
                 decision = await structured_llm.ainvoke(
-                    [SystemMessage(content=TRIAGE_PROMPT)] + list(state["messages"])
+                    [SystemMessage(content=TRIAGE_PROMPT)] + list(state["messages"][-3:])
                 )
             except Exception as exc:
-                logger.warning(f"Primary model '{settings.GEMINI_MODEL}' failed: {exc}. Attempting fallback...")
+                logger.warning(f"Primary model triage failed: {exc}. Attempting fallback...")
                 if fallback_llm:
                     try:
                         fallback_structured = fallback_llm.with_structured_output(TriageDecision)
                         decision = await fallback_structured.ainvoke(
-                            [SystemMessage(content=TRIAGE_PROMPT)] + list(state["messages"])
+                            [SystemMessage(content=TRIAGE_PROMPT)] + list(state["messages"][-3:])
                         )
                     except Exception as fb_exc:
                         logger.warning(f"Fallback model failed: {fb_exc}. Using deterministic heuristic.")
@@ -199,7 +261,10 @@ async def context_loader_node(state: ResolveOpsState, *, store: Optional[BaseSto
 # ---------------------------------------------------------------------------
 async def investigation_node(state: ResolveOpsState) -> Dict[str, Any]:
     last_msg = state["messages"][-1].content if state.get("messages") else ""
-    order_id = extract_order_id_from_messages(list(state.get("messages", [])))
+    is_general_listing = any(k in last_msg.lower() for k in ["list", "my orders", "all orders", "show orders", "history", "purchases"])
+
+    # If the user is asking for general order listing, do NOT latch onto an old order ID from earlier in the thread
+    order_id = None if is_general_listing else extract_order_id_from_context(list(state.get("messages", [])))
 
     with ExecutionTimer() as timer:
         order_evidence: Dict[str, Any] = {}
@@ -232,86 +297,131 @@ async def investigation_node(state: ResolveOpsState) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Conditional Branch after Investigation
+# Dynamic Routing Condition: Action Mutation vs. Conversational Reasoning
 # ---------------------------------------------------------------------------
-def check_investigation_sufficiency(state: ResolveOpsState) -> Literal["ask_clarifying", "policy_rag", "order_ineligible", "order_not_found", "propose_resolution", "security_abort"]:
+def check_investigation_sufficiency(state: ResolveOpsState) -> Literal["propose_resolution", "conversational_response", "security_abort"]:
     if state.get("escalation_reason") == "Prompt injection attempt detected.":
         return "security_abort"
 
-    if state.get("current_route") == "policy_rag":
-        return "policy_rag"
+    route = state.get("current_route")
 
-    order_id = extract_order_id_from_messages(list(state.get("messages", [])))
-    if not order_id:
-        return "ask_clarifying"
+    # Only route to mutation planner if user is explicitly pursuing a refund
+    if route == "billing_refund":
+        last_msg = state["messages"][-1].content if state.get("messages") else ""
+        is_general_listing = any(k in last_msg.lower() for k in ["list", "my orders", "all orders"])
+        order_id = None if is_general_listing else extract_order_id_from_context(list(state.get("messages", [])))
 
-    evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
-    order_data = evidence_map.get("get_order_details", {})
+        if order_id:
+            evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
+            order_data = evidence_map.get("get_order_details", {})
+            # Only plan mutation if order was found and is return eligible
+            if order_data.get("found") and order_data.get("is_return_eligible"):
+                return "propose_resolution"
 
-    if not order_data.get("found"):
-        return "order_not_found"
-
-    if not order_data.get("is_return_eligible"):
-        return "order_ineligible"
-
-    return "propose_resolution"
+    # All inquiries, order listings, tracking, policy FAQs, and clarifications are handled conversationally
+    return "conversational_response"
 
 
 # ---------------------------------------------------------------------------
-# Node 5a: Clarification Node
+# Node 5: Autonomous Conversational Reasoner (Context-Aware LLM Response)
 # ---------------------------------------------------------------------------
-async def ask_clarifying_node(state: ResolveOpsState) -> Dict[str, Any]:
+async def conversational_response_node(state: ResolveOpsState) -> Dict[str, Any]:
     evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
     cust_data = evidence_map.get("get_customer_history", {})
-    recent_orders = cust_data.get("recent_orders", [])
-
-    if recent_orders:
-        orders_summary = "\n".join([f"- {o['order_id']} (${o['total']:.2f}, {o['status']})" for o in recent_orders[:3]])
-        reply = (
-            f"I can help you with your refund or return request. To make sure I assist with the correct purchase, "
-            f"could you please specify which order you would like to resolve?\n\n"
-            f"Here are your recent orders:\n{orders_summary}\n\n"
-            f"Please reply with the Order ID (e.g. {recent_orders[0]['order_id']}) and the reason."
-        )
-    else:
-        reply = (
-            "I can assist you with your refund inquiry. Could you please provide your Order ID "
-            "and a brief description of the issue?"
-        )
-
-    return {"messages": [AIMessage(content=reply)]}
-
-
-# ---------------------------------------------------------------------------
-# Node 5b: Order Not Found / Policy Ineligible Nodes
-# ---------------------------------------------------------------------------
-async def order_not_found_node(state: ResolveOpsState) -> Dict[str, Any]:
-    order_id = extract_order_id_from_messages(list(state.get("messages", []))) or "your order"
-    evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
-    order_data = evidence_map.get("get_order_details", {})
-    message = order_data.get("message") or f"We could not locate order '{order_id}' under your account. Please verify the order number."
-    return {"messages": [AIMessage(content=message)]}
-
-
-async def order_ineligible_node(state: ResolveOpsState) -> Dict[str, Any]:
-    order_id = extract_order_id_from_messages(list(state.get("messages", []))) or "your order"
-    evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
     policy_data = evidence_map.get("search_refund_policy", {})
-    window = policy_data.get("return_window_days", settings.RETURN_WINDOW_DAYS_DEFAULT)
+    order_data = evidence_map.get("get_order_details", {})
+    last_msg = state["messages"][-1].content if state.get("messages") else ""
 
-    reply = (
-        f"Order '{order_id}' is outside our {window}-day return eligibility window. "
-        f"Under company policy ({policy_data.get('title', 'Resolution Policy')}), automated refunds cannot be processed for expired orders."
-    )
-    return {"messages": [AIMessage(content=reply)]}
+    # Construct context evidence block
+    orders_list = cust_data.get("recent_orders", [])
+    orders_text = "\n".join([
+        f"- Order ID: {o['order_id']} | Total: ${o['total']:.2f} | Status: {o['status']} | Date: {o.get('date', 'N/A')} | Tracking: {o.get('tracking_number', 'N/A')} | Return Eligible: {o.get('is_return_eligible')}"
+        for o in orders_list
+    ]) if orders_list else "No past orders found under this account."
+
+    evidence_context = f"""
+[Customer Account Profile]
+Customer ID: {state['customer_id']}
+Name: {cust_data.get('name', 'Customer')}
+Tier: {cust_data.get('tier', 'Standard')}
+Trust Score: {cust_data.get('trust_score', 0.95)}
+Total Orders: {cust_data.get('total_orders', 0)}
+
+[Customer Registered Orders in Database]
+{orders_text}
+
+[Active Business Policy from Database]
+Title: {policy_data.get('title', 'Standard Policy')}
+Policy Details: {policy_data.get('content', 'Refunds permitted within 30 days of delivery.')}
+Auto-Approval Limit: ${policy_data.get('max_automated_limit', 100.0):.2f}
+Return Window: {policy_data.get('return_window_days', 30)} days
+
+[Specific Order Lookup (if requested)]
+{order_data if order_data else 'None requested or order does not belong to this customer account.'}
+"""
+
+    response_text = None
+
+    # 1. Attempt LLM Generation with Context Evidence
+    if llm:
+        try:
+            messages = [
+                SystemMessage(content=AUTONOMOUS_SYSTEM_PROMPT),
+                SystemMessage(content=f"REAL-TIME EVIDENCE CONTEXT:\n{evidence_context}"),
+            ] + list(state["messages"][-4:])
+            ai_msg = await llm.ainvoke(messages)
+            response_text = ai_msg.content.strip()
+        except Exception as exc:
+            logger.warning(f"LLM generation failed: {exc}. Attempting fallback model...")
+            if fallback_llm:
+                try:
+                    fallback_msg = await fallback_llm.ainvoke(messages)
+                    response_text = fallback_msg.content.strip()
+                except Exception:
+                    pass
+
+    # 2. Resilient Deterministic Fallback if Model Call is Unavailable
+    if not response_text:
+        last_lower = last_msg.lower()
+        if any(k in last_lower for k in ["list", "my orders", "all orders", "show orders", "purchases"]):
+            if orders_list:
+                orders_summary = "\n".join([
+                    f"- {o['order_id']}: ${o['total']:.2f} | Status: {o['status']} | Tracking: {o.get('tracking_number', 'N/A')}"
+                    for o in orders_list
+                ])
+                response_text = f"Here are the orders associated with your account:\n\n{orders_summary}\n\nPlease let me know if you would like to track, return, or resolve any of these purchases."
+            else:
+                response_text = "We did not find any recent orders associated with your account. Please check the account number or provide an Order ID."
+        elif any(k in last_lower for k in ["track", "where is"]):
+            if order_data and order_data.get("found"):
+                response_text = f"Order {order_data['order_id']} is currently {order_data['status']}. Tracking Number: {order_data.get('tracking_number', 'N/A')}. Delivered: {order_data.get('delivered_date', 'In Transit')}."
+            elif orders_list:
+                latest = orders_list[0]
+                response_text = f"Your most recent order {latest['order_id']} is {latest['status']} with tracking number {latest.get('tracking_number', 'N/A')}."
+            else:
+                response_text = "Could you please specify the Order ID you wish to track?"
+        elif any(k in last_lower for k in ["refund", "return", "broken", "damaged"]):
+            if orders_list:
+                orders_summary = "\n".join([f"- {o['order_id']} (${o['total']:.2f}, {o['status']})" for o in orders_list[:3]])
+                response_text = (
+                    f"I can help you with your return or refund request. To make sure I assist with the correct purchase, "
+                    f"could you please specify which order you would like to resolve?\n\nHere are your recent orders:\n{orders_summary}\n\n"
+                    f"Please reply with the Order ID (e.g. {orders_list[0]['order_id']}) and the reason."
+                )
+            else:
+                response_text = "I can assist you with your refund inquiry. Could you please provide your Order ID and a description of the issue?"
+        else:
+            response_text = f"{policy_data.get('title', 'Resolution Policy')}:\n\n{policy_data.get('content', 'Refunds and returns are supported within 30 days of delivery.')}"
+
+    return {"messages": [AIMessage(content=response_text)]}
 
 
 # ---------------------------------------------------------------------------
-# Node 5c: Resolution Planner
+# Node 6: Resolution Planner (When refunding a verified eligible order)
 # ---------------------------------------------------------------------------
 async def resolution_planner_node(state: ResolveOpsState) -> Dict[str, Any]:
     last_msg = state["messages"][-1].content if state.get("messages") else ""
-    order_id = extract_order_id_from_messages(list(state.get("messages", [])))
+    order_id = extract_order_id_from_context(list(state.get("messages", [])))
 
     evidence_map = {e["source"]: e["data"] for e in state.get("investigation_evidence", [])}
     order_data = evidence_map.get("get_order_details", {})
@@ -343,7 +453,7 @@ async def resolution_planner_node(state: ResolveOpsState) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Routing Guard: Escalation & Policy Guard (Dynamic Threshold from DB Policy)
+# Routing Guard: Dynamic Threshold from PostgreSQL Policy
 # ---------------------------------------------------------------------------
 def check_escalation_guard(state: ResolveOpsState) -> Literal["suspend_for_hitl", "execute_mutation"]:
     action = state.get("pending_action")
@@ -354,7 +464,6 @@ def check_escalation_guard(state: ResolveOpsState) -> Literal["suspend_for_hitl"
     policy_data = evidence_map.get("search_refund_policy", {})
     policy_limit = float(policy_data.get("max_automated_limit", settings.MAX_AUTO_REFUND_LIMIT_DEFAULT))
 
-    # Business Rule: Transactions exceeding policy limit require human supervisor sign-off
     if action.action_type == "refund_order" and action.amount > policy_limit:
         return "suspend_for_hitl"
 
@@ -365,7 +474,7 @@ def check_escalation_guard(state: ResolveOpsState) -> Literal["suspend_for_hitl"
 
 
 # ---------------------------------------------------------------------------
-# Node 6: Human-in-the-Loop Suspension
+# Node 7: Human-in-the-Loop Suspension
 # ---------------------------------------------------------------------------
 def hitl_suspension_node(state: ResolveOpsState) -> Dict[str, Any]:
     action = state["pending_action"]
@@ -394,13 +503,13 @@ def hitl_suspension_node(state: ResolveOpsState) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Node 7: Action Executor (PostgreSQL Mutation + Redis Locks)
+# Node 8: Action Executor (PostgreSQL Mutation + Redis Locks)
 # ---------------------------------------------------------------------------
 async def tool_execution_node(state: ResolveOpsState) -> Dict[str, Any]:
     if state.get("admin_approval_status") == "REJECTED":
         return {
             "action_results": [{"status": "ABORTED", "message": "Transaction rejected by supervisor."}],
-            "messages": [AIMessage(content="Your refund exceeds auto-approval limits and was declined by supervisor review.")]
+            "messages": [AIMessage(content="Your refund request was reviewed by a supervisor and declined in accordance with store policy.")]
         }
 
     action = state["pending_action"]
@@ -422,7 +531,7 @@ async def tool_execution_node(state: ResolveOpsState) -> Dict[str, Any]:
             )
             return {
                 "action_results": [res],
-                "messages": [AIMessage(content=f"Successfully refunded ${action.amount:.2f} for order {action.entity_id}. Transaction ID: {res.get('transaction_id')}.")]
+                "messages": [AIMessage(content=f"Successfully processed refund of ${action.amount:.2f} for order {action.entity_id}. Settlement Transaction ID: {res.get('transaction_id')}.")]
             }
         except LockAcquisitionError:
             return {"error_trace": "Resource contention lock held."}
@@ -432,20 +541,8 @@ async def tool_execution_node(state: ResolveOpsState) -> Dict[str, Any]:
             logger.error(f"Tool execution failed: {exc}")
             return {
                 "action_results": [{"status": "FAILED", "error": str(exc)}],
-                "messages": [AIMessage(content=f"An error occurred while processing refund: {str(exc)}")]
+                "messages": [AIMessage(content=f"An error occurred while executing the transaction: {str(exc)}")]
             }
-
-
-# ---------------------------------------------------------------------------
-# Node 8: Policy RAG Response (Full-Text Search Grounded)
-# ---------------------------------------------------------------------------
-async def policy_rag_node(state: ResolveOpsState) -> Dict[str, Any]:
-    last_msg = state["messages"][-1].content if state.get("messages") else ""
-    policy_info = await search_refund_policy(last_msg)
-    title = policy_info.get("title", "Policy Information")
-    policy_text = policy_info.get("content", "Standard resolution policy applies.")
-    response_text = f"**{title}**\n\n{policy_text}"
-    return {"messages": [AIMessage(content=response_text)]}
 
 
 # ---------------------------------------------------------------------------
@@ -480,34 +577,30 @@ def build_resolveops_graph(checkpointer: AsyncPostgresSaver, store: Optional[Bas
     workflow.add_node("triage", triage_node)
     workflow.add_node("context_loader", context_loader_node)
     workflow.add_node("investigation", investigation_node)
-    workflow.add_node("ask_clarifying", ask_clarifying_node)
-    workflow.add_node("order_not_found", order_not_found_node)
-    workflow.add_node("order_ineligible", order_ineligible_node)
+    workflow.add_node("conversational_response", conversational_response_node)
     workflow.add_node("resolution_planner", resolution_planner_node)
     workflow.add_node("hitl_suspension", hitl_suspension_node)
     workflow.add_node("tool_execution", tool_execution_node)
-    workflow.add_node("policy_rag", policy_rag_node)
     workflow.add_node("verifier_and_memory", verifier_and_memory_node)
 
-    # Deterministic control flow
+    # Main DAG transitions
     workflow.add_edge(START, "guardrail_input")
     workflow.add_edge("guardrail_input", "triage")
     workflow.add_edge("triage", "context_loader")
     workflow.add_edge("context_loader", "investigation")
 
+    # Conditional Branch: Action Mutation vs. Conversational Reasoning
     workflow.add_conditional_edges(
         "investigation",
         check_investigation_sufficiency,
         {
-            "ask_clarifying": "ask_clarifying",
-            "order_not_found": "order_not_found",
-            "order_ineligible": "order_ineligible",
-            "policy_rag": "policy_rag",
+            "conversational_response": "conversational_response",
             "propose_resolution": "resolution_planner",
             "security_abort": END
         }
     )
 
+    # Resolution planner routes to HITL suspension or immediate mutation execution
     workflow.add_conditional_edges(
         "resolution_planner",
         check_escalation_guard,
@@ -517,12 +610,9 @@ def build_resolveops_graph(checkpointer: AsyncPostgresSaver, store: Optional[Bas
         }
     )
 
-    workflow.add_edge("ask_clarifying", "verifier_and_memory")
-    workflow.add_edge("order_not_found", "verifier_and_memory")
-    workflow.add_edge("order_ineligible", "verifier_and_memory")
+    workflow.add_edge("conversational_response", "verifier_and_memory")
     workflow.add_edge("hitl_suspension", "tool_execution")
     workflow.add_edge("tool_execution", "verifier_and_memory")
-    workflow.add_edge("policy_rag", "verifier_and_memory")
     workflow.add_edge("verifier_and_memory", END)
 
     return workflow.compile(checkpointer=checkpointer, store=store)

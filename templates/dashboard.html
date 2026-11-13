@@ -59,11 +59,12 @@
                 </div>
                 <div class="flex items-center space-x-2">
                     <label class="text-xs text-gray-400">Customer:</label>
-                    <select id="customerIdSelect" class="bg-gray-800 text-gray-200 text-xs border border-gray-700 rounded px-2 py-1 outline-none focus:border-emerald-500">
+                    <select id="customerIdSelect" onchange="handleCustomerChange()" class="bg-gray-800 text-gray-200 text-xs border border-gray-700 rounded px-2 py-1 outline-none focus:border-emerald-500">
                         <option value="CUST-1001">CUST-1001 (Alexander - Gold)</option>
                         <option value="CUST-1002">CUST-1002 (Olivia - Silver)</option>
                         <option value="CUST-1005">CUST-1005 (Emma - Standard)</option>
                     </select>
+                    <button onclick="startNewThread()" class="text-xs px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700">New Thread</button>
                 </div>
             </div>
 
@@ -71,6 +72,8 @@
             <div class="p-3 border-b border-gray-800 bg-gray-950/60 text-xs">
                 <span class="text-gray-400 font-medium mr-2">Interview Scenarios:</span>
                 <div class="flex flex-wrap gap-1.5 mt-2">
+                    <button onclick="setPrompt('list down all my orders')" class="px-2 py-1 rounded bg-gray-800 hover:bg-emerald-950 hover:text-emerald-300 border border-gray-700 transition">List All My Orders</button>
+                    <button onclick="setPrompt('where is my order? can you track it?')" class="px-2 py-1 rounded bg-gray-800 hover:bg-emerald-950 hover:text-emerald-300 border border-gray-700 transition">Track Orders</button>
                     <button onclick="setPrompt('I want a refund of $120 for order ORD-9821. It arrived completely broken.')" class="px-2 py-1 rounded bg-gray-800 hover:bg-emerald-950 hover:text-emerald-300 border border-gray-700 transition">High Refund (> $100)</button>
                     <button onclick="setPrompt('Can I get a refund of $45.50 for order ORD-1002? The item was defective.')" class="px-2 py-1 rounded bg-gray-800 hover:bg-emerald-950 hover:text-emerald-300 border border-gray-700 transition">Auto Refund (< $100)</button>
                     <button onclick="setPrompt('I want to return an item I ordered last week.')" class="px-2 py-1 rounded bg-gray-800 hover:bg-emerald-950 hover:text-emerald-300 border border-gray-700 transition">Missing Order ID</button>
@@ -212,6 +215,22 @@
     <script>
         let currentThreadId = null;
         let pendingInterrupts = [];
+
+        function handleCustomerChange() {
+            startNewThread();
+        }
+
+        function startNewThread() {
+            currentThreadId = null;
+            const container = document.getElementById('chatMessages');
+            const custId = document.getElementById('customerIdSelect').value;
+            container.innerHTML = `
+                <div class="bg-gray-800/60 border border-gray-700/60 rounded-lg p-3 text-gray-300">
+                    <p class="text-xs font-mono text-emerald-400 mb-1">Active Account: ${custId}</p>
+                    <p class="text-xs">Fresh conversation thread initialized for ${custId}. You can now ask questions, list orders, or test refunds for this account.</p>
+                </div>
+            `;
+        }
 
         function setPrompt(text) {
             document.getElementById('chatInput').value = text;
