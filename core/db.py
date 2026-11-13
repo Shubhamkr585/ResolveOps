@@ -14,9 +14,11 @@ _db_pool: Optional[AsyncConnectionPool] = None
 def get_db_pool() -> AsyncConnectionPool:
     global _db_pool
     if _db_pool is None:
+        # Scale down pool size in serverless environments (Vercel) to prevent connection spikes
+        pool_size = 3 if os.getenv("VERCEL") else 20
         _db_pool = AsyncConnectionPool(
             conninfo=settings.DATABASE_URL,
-            max_size=20,
+            max_size=pool_size,
             kwargs={"autocommit": True}
         )
     return _db_pool

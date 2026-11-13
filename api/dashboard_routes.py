@@ -39,10 +39,15 @@ def remove_suspended_interrupt(thread_id: str) -> None:
 @router.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
     """Serves the interactive single-page interview demonstration dashboard."""
-    template_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates", "dashboard.html")
-    if os.path.exists(template_path):
-        with open(template_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
+    candidate_paths = [
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates", "dashboard.html"),
+        os.path.join(os.getcwd(), "templates", "dashboard.html"),
+        os.path.abspath("templates/dashboard.html")
+    ]
+    for path in candidate_paths:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return HTMLResponse(content=f.read())
     return HTMLResponse(content="<h1>ResolveOps Dashboard Template Missing</h1>", status_code=500)
 
 
@@ -124,3 +129,4 @@ async def api_dashboard_resume(payload: DashboardResumeRequest, request: Request
     except Exception as exc:
         logger.exception(f"Error resuming graph via dashboard: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
